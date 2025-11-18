@@ -13,18 +13,40 @@ HE_NUMS = {
     "שישה": 6, "שש": 6, "שבעה": 7, "שבע": 7,
     "שמונה": 8, "תשעה": 9, "תשע": 9, "עשרה": 10, "עשר": 10,
 }
-
 INTENTS = {
-    "WHO_AT_RISK_TODAY": re.compile(r"(מי|איזה)\s+(אוטובוס|אוטובוסים)?.*בסיכון(\s*היום)?\??", re.IGNORECASE),
-    "BUS_STATUS": re.compile(r"(?:\bBUS[_\-\s]*|\bאוטובוס\s*)(\d{1,3})\b", re.IGNORECASE),
-    "MOST_REPLACED_PARTS": re.compile(r"(איזה|מהם)\s+חלק(ים)?\s+(שהוחלפו|הוחלפו)\s+הכי\s+הרבה", re.IGNORECASE),
-    "WHAT_HAPPENED_LAST_DAYS": re.compile(r"(מה\sקרה\sבשבועיים|מה\sקרה\sב\d+\s*יום)", re.IGNORECASE),
-    "BUS_MOST_FAILURES": re.compile(r"(הכי הרבה תקלות|הכי הרבה\s+תקלות)", re.IGNORECASE),
+    "WHO_AT_RISK_TODAY": re.compile(
+        r"(מי|איזה)\s+(אוטובוס|אוטובוסים)?.*בסיכון(\s*היום)?\??",
+        re.IGNORECASE,
+    ),
+    "BUS_STATUS": re.compile(
+        r"(?:\bBUS[_\-\s]*|\bאוטובוס\s*)(\d{1,3})\b",
+        re.IGNORECASE,
+    ),
+    "MOST_REPLACED_PARTS": re.compile(
+        r"(איזה|מהם)\s+חלק(ים)?\s+(שהוחלפו|הוחלפו)\s+הכי\s+הרבה",
+        re.IGNORECASE,
+    ),
+    "WHAT_HAPPENED_LAST_DAYS": re.compile(
+        r"(מה\sקרה\sבשבועיים|מה\sקרה\sב\d+\s*יום)",
+        re.IGNORECASE,
+    ),
+    # כל התקלות שהיו לאוטובוס מסוים
+    "BUS_ALL_FAILURES": re.compile(
+        r"(כל\s+התקלות|סיכום\s+כל\s+התקלות).*?(bus|אוטובוס)",
+        re.IGNORECASE,
+    ),
+    "BUS_MOST_FAILURES": re.compile(
+        r"(הכי הרבה תקלות|הכי הרבה\s+תקלות)",
+        re.IGNORECASE,
+    ),
     "HIGHEST_RISK_N": re.compile(
         r"(?:חמש(?:ת)?|ארבע(?:ה)?|שלוש(?:ה)?|שתיים|שניים|עשר(?:ה)?|\d+)\s+האוטובוסים?\s+.*בסיכון\s+(?:הכי|הגבוה(?:ה)?(?:\sביותר)?)\s*(?:היום)?",
         re.IGNORECASE,
     ),
-    "TOP_LIST": re.compile(r"(top|טופ)\s*(\d+)?", re.IGNORECASE),
+    "TOP_LIST": re.compile(
+        r"(top|טופ)\s*(\d+)?",
+        re.IGNORECASE,
+    ),
     "ANY_NATURAL_RANGE": re.compile(
         r"(מה\sקרה\b.*)|\b(last|past)\b|\bמאז\b|\bמ[- ]\d|\bעד\b|\bשבוע האחרון\b|\bחודש האחרון\b|\bשנה האחרונה\b",
         re.IGNORECASE,
@@ -32,11 +54,13 @@ INTENTS = {
 }
 
 
+
 def normalize_bus_id(text: str) -> str | None:
     m = re.search(r"\bbus[_\-\s]*(\d{1,3})\b", text, re.IGNORECASE) or re.search(
-        r"\bאוטובוס\s*(\d{1,3})\b", text, re.IGNORECASE
+        r"\b(?:ל|אל)?אוטובוס\s*(\d{1,3})\b", text, re.IGNORECASE
     )
     return f"BUS_{int(m.group(1)):03d}" if m else None
+
 
 
 def extract_top_n(text: str, default_n: int) -> int:

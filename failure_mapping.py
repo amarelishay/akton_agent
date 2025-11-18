@@ -88,3 +88,106 @@ def map_failure_types_from_query(user_text: str) -> list[str]:
     except Exception as e:
         log_agent("map_failure_types_from_query failed", error=str(e))
         return []
+# =========================
+#  Likely Fault Mapping
+# =========================
+import re
+from difflib import SequenceMatcher
+
+# הערכים הקנוניים בעמודה likely_fault
+LIKELY_FAULT_CANONICAL = [
+    "Unknown",
+    "Engine",
+    "Transmission/Suspension",
+    "Cooling/Engine",
+    "Part wear",
+    "Brake",
+]
+
+# מילון של מילים נרדפות (עברית + אנגלית + שגיאות נפוצות) לכל קטגוריה
+LIKELY_FAULT_SYNONYMS = {
+    "Engine": [
+        "engine", "motor", "engine failure", "engine problem",
+        "מנוע", "מנועים",
+    ],
+    "Cooling/Engine": [
+        "cooling", "ac", "a/c", "aircon", "air conditioner",
+        "air conditioning", "hvac", "cooler", "cooling system",
+        "מזגן", "מזוג", "קירור", "קירור מנוע", "מערכת קירור",
+    ],
+    "Brake": [
+        "brake", "brakes", "braking", "abs", "brake system",
+        "בלם", "בלמים", "מערכת בלימה",
+    ],
+    "Transmission/Suspension": [
+        "transmission", "gearbox", "gear", "shift",
+        "suspension", "shock", "shocks",
+        "גיר", "תמסורת", "תיבת הילוכים", "מתלים", "בולמים",
+    ],
+    "Part wear": [
+        "wear", "part wear", "wearing",
+        "שחיקה", "בלאי", "שחיקת חלקים",
+    ],
+    "Unknown": [],
+}
+
+
+def _tokenize_for_faults(text: str) -> list[str]:
+    """פירוק פשוט של הטקסט למילים, לעבודה עם fuzzy matching."""
+    return re.findall(r"[א-תA-Za-z]+", (text or "").lower())
+
+
+def map_likely_faults_from_query(user_text: str) -> list[str]:
+    """
+    מקבל שאלה בשפה חופשית (עברית/אנגלית, כולל שגיאות),
+    ומחזיר רשימת קטגוריות likely_fault קנוניות מתאימות.
+    לדוגמה:
+      'מזגן'  → ['Cooling/Engine']
+      'בלמים' → ['Brake']
+      'מזגן ובלמים' → ['Cooling/Engine', 'Brake']
+    """
+    text = (user_text or "").lower()
+    tokens = _tokenize_for_faults(text)
+
+    mapped: list[str] = []
+
+    for canon, synonyms in LIKELY_FAULT_SYNONYMS.items():
+        found = False
+
+        # 1. התאמה ישירה – מילה נרדפת שהיא substring בשאלה
+        for s in synonyms:
+            if s.lower() in text:
+                mapped.append(canon)
+                found = True
+                break
+        if found:
+            continue
+
+        # 2. fuzzy matching – מאפשר שגיאות כתיב
+        for s in synonyms:
+            s_low = s.lower()
+            for tok in tokens:
+                if len(tok) < 3:
+                    continue
+                ratio = SequenceMatcher(None, tok, s_low).ratio()
+                if ratio >= 0.8:
+                    mapped.append(canon)
+                    found = True
+                    break
+            if found:
+                break
+
+    # הסרה של כפולים, שמירה על סדר
+    seen = set()
+    uniq: list[str] = []
+    for m in mapped:
+        if m not in seen:
+            seen.add(m)
+            uniq.append(m)
+
+    try:
+        log_agent("Mapped likely_fault from query", query=user_text, mapped=uniq)
+    except Exception:
+        pass
+
+    return uniq

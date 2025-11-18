@@ -60,27 +60,58 @@ def paraphrase_he(text: str) -> str:
     except Exception:
         return text
 
-
+def pretty_bus_id(bus_id: str | None) -> str:
+    """
+    מציג BUS_032 כ-'BUS 32'. אם הפורמט שונה – מחזיר כמו שהוא.
+    """
+    s = (bus_id or "").strip()
+    m = re.match(r"^BUS_?0*(\d+)$", s)
+    if m:
+        return f"BUS {int(m.group(1))}"
+    return s
 def add_row_explanation(df: pd.DataFrame, prob_col: str) -> pd.DataFrame:
     if df.empty:
         return df
+
     df = df.copy()
+
+    # מילוי reason_he ו-where_he אם חסרים
     if "reason_he" not in df and "failure_reason" in df.columns:
         df["reason_he"] = df["failure_reason"].apply(humanize_reason_he)
     if "where_he" not in df and "likely_fault" in df.columns:
         df["where_he"] = df["likely_fault"].apply(where_from_likely_fault)
 
+    def _bus_display(raw_bus: object) -> str:
+        """
+        מציג BUS_032 כ-'BUS 32'. אם הפורמט שונה – מחזיר כמו שהוא.
+        """
+        s = str(raw_bus or "").strip()
+        m = re.match(r"^BUS[_\-\s]*0*(\d+)$", s, re.IGNORECASE)
+        return f"BUS {int(m.group(1))}" if m else s
+
+    # 🔹 החלטה: מתי להשתמש ב־LLM
+    # עד 50 שורות – שכתוב יפה עם OpenAI
+    # מעל 50 – טקסט ישיר, בלי קריאת API (מהיר בהרבה)
+    use_llm = bool(OPENAI_API_KEY) and len(df) <= 50
+
     def _ex(r):
-        p = r.get(prob_col, None)
+        p = r.get(prob_col)
         p_txt = f"{p:.0%}" if isinstance(p, (int, float)) else "N/A"
-        bus = r.get("bus_id", "")
+
+        bus_display = _bus_display(r.get("bus_id"))
         d = r.get("d", r.get("date", ""))
+
         base = (
-            f"אוטובוס {bus} בתאריך {d}: הסתברות לשבוע הקרוב {p_txt}. "
+            f"אוטובוס {bus_display} בתאריך {d}: הסתברות לשבוע הקרוב {p_txt}. "
             f"גורמים בולטים: {r.get('reason_he', '')}. "
             f"איפה עלולה להיות התקלה: {r.get('where_he', '')}."
         )
-        return paraphrase_he(base)
+
+        if use_llm:
+            return paraphrase_he(base)
+        else:
+            # בלי LLM – טקסט ישיר, מהיר
+            return base
 
     df["explanation_he"] = df.apply(_ex, axis=1)
     return df
