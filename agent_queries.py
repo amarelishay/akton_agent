@@ -65,6 +65,21 @@ ORDER BY p.proba_7d DESC NULLS LAST
 LIMIT 1
 """
 
+SQL_TOP_RISK_TODAY = f"""
+SELECT
+    p.bus_id,
+    p.date::date AS d,
+    p.proba_7d   AS predicted_proba,
+    p.label_7d   AS predicted_label,
+    p.failure_reason,
+    p.likely_fault
+FROM {PRED_SRC}
+WHERE p.date::date = :d
+ORDER BY p.proba_7d DESC NULLS LAST
+LIMIT :limit
+"""
+
+
 SQL_BUS_TODAY = f"""
 SELECT
     p.bus_id,
@@ -155,7 +170,18 @@ def _enrich_with_human_explanation(df: pd.DataFrame, prob_col: str) -> pd.DataFr
 # =========================
 
 def df_at_risk_today(d: date, limit: int) -> pd.DataFrame:
+    """
+    אוטובוסים בסיכון מעל סף ברירת המחדל (כיום 50%).
+    """
     df = q(SQL_AT_RISK_TODAY, {"d": d, "limit": limit})
+    return _enrich_with_human_explanation(df, prob_col="predicted_proba")
+
+
+def df_top_risk_today(d: date, limit: int) -> pd.DataFrame:
+    """
+    Top N אוטובוסים עם הסיכון הגבוה ביותר היום (ללא סף מינימלי).
+    """
+    df = q(SQL_TOP_RISK_TODAY, {"d": d, "limit": limit})
     return _enrich_with_human_explanation(df, prob_col="predicted_proba")
 
 
@@ -359,40 +385,54 @@ def _extract_tables(sql: str) -> set[str]:
         tables.add(name)
     return tables
 
+def _extract_defined_ctes(sql: str) -> set[str]:
+    """
+    מזהה שמות של טבלאות זמניות (CTEs) שהוגדרו בתוך השאילתה.
+    לדוגמה: עבור "WITH my_table AS (...)" הפונקציה תחזיר את "my_table".
+    """
+    # המחרוזת מחפשת מילה, רווח (אופציונלי), המילה AS, ואז סוגר פותח
+    # זה תופס את רוב הוריאציות של CTE ש-LLM מייצר
+    pattern = r"\b([a-zA-Z0-9_]+)\s+AS\s*\("
+    return set(re.findall(pattern, sql, re.IGNORECASE))
+
 
 def is_sql_safe(sql: str) -> Tuple[bool, str]:
     s = sql.strip()
     low = s.lower()
 
+    # בדיקה בסיסית: חייב להתחיל ב-SELECT או WITH
     if not (SELECT_ONLY.match(low) or CTE_START.match(low)):
         return False, "Only SELECT (or CTE starting with WITH) is allowed."
 
     forbidden = [
-        "insert",
-        "update",
-        "delete",
-        "drop",
-        "alter",
-        "truncate",
-        "create",
-        "grant",
-        "revoke",
-        "copy",
-        "vacuum",
+        "insert", "update", "delete", "drop", "alter", "truncate",
+        "create", "grant", "revoke", "copy", "vacuum",
     ]
     if any(re.search(rf"\b{kw}\b", low) for kw in forbidden):
         return False, "Write or DDL keywords are not allowed."
 
-    used = _extract_tables(low)
-    for t in used:
-        if t in ("p",):
+    # 1. שליפת כל הטבלאות שהשאילתה מנסה לגשת אליהן
+    used_tables = _extract_tables(low)
+
+    # 2. שליפת השמות שהוגדרו זמנית בתוך השאילתה (CTE)
+    defined_ctes = _extract_defined_ctes(low)
+
+    # 3. סינון: אנו בודקים רק טבלאות שלא הוגדרו כ-CTE
+    tables_to_validate = used_tables - defined_ctes
+
+    for t in tables_to_validate:
+        if t in ("p",):  # התעלמות מ-alias ידועים נוספים אם יש
             continue
-        t_norm = t if "." in t else f"public.{t}"
+
+        # ניקוי סכמה כפולה אם המשתמש כתב public.public.table (קורה לפעמים עם LLM)
+        t_clean = t.replace("public.", "")
+        t_norm = f"public.{t_clean}"  # תמיד מנרמלים ל-public בשביל הבדיקה
+
+        # בדיקה מול הרשימה המאושרת
         if t_norm not in ALLOWED_TABLES:
-            return False, f"Table {t_norm} is not in allowed tables."
+            return False, f"Table {t_norm} is not in allowed tables (detected CTEs: {defined_ctes})."
 
     return True, ""
-
 
 def _force_limit_param(sql: str) -> str:
     """מוודא שיש LIMIT :limit פרמטרי בסוף השאילתה."""

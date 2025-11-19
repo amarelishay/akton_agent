@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date as dt_date, timedelta, date
+import datetime as dt
+from datetime import date, timedelta
 from typing import Any
-import datetime as dt  # ← להוסיף שורה זו
+import re as _re2
 
 import pandas as pd
 import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
+# --- מודולים קיימים ---
 from .config import resolve_openai_key
 from .humanize import paraphrase_he, pretty_bus_id
 from .intents import detect_intents
 from .agent_queries import (
     df_at_risk_today,
+    df_top_risk_today,
     df_bus_today,
     df_bus_history,
     df_parts_replaced_last_30d,
@@ -32,8 +35,19 @@ from .failure_mapping import (
 from .utils_logging import log_agent
 from . import shared_state
 
+# --- מודול חדש לניהול צ'אט ---
+# ודא שיצרת את הקובץ db_chat.py באותה תיקייה!
+from .db_chat import (
+    create_conversation,
+    list_conversations,
+    load_messages,
+    save_message,
+    update_conversation_title,
+    generate_chat_title,
+)
+
 # -------------------------------------------------
-# הגדרות בסיס ל-Streamlit
+# הגדרות בסיס
 # -------------------------------------------------
 
 st.set_page_config(
@@ -44,15 +58,13 @@ st.set_page_config(
 
 OPENAI_API_KEY = resolve_openai_key()
 
-# טווח הדאטה בפועל (סימולציה)
-SIM_MIN_DATE = dt_date(2023, 1, 1)
-SIM_MAX_DATE = dt_date(2024, 12, 31)
+SIM_MIN_DATE = date(2023, 1, 1)
+SIM_MAX_DATE = date(2024, 12, 31)
 
 
 # -------------------------------------------------
 # כלי עזר UI
 # -------------------------------------------------
-
 
 class fancy_spinner:
     def __init__(self, msg: str = "מעבד את הבקשה..."):
@@ -79,12 +91,7 @@ def _is_risk_query(text: str) -> bool:
 
 
 def _extract_days_from_query(text: str, default: int = 30) -> int:
-    """
-    מחלץ מספר ימים מהשאלה ('11 ימים', '11 יום', '11 days').
-    אם לא מוצא – מחזיר default.
-    """
     import re as _re
-
     m = _re.search(r"(\d+)\s*(יום|ימים|day|days)", (text or ""))
     if m:
         try:
@@ -96,9 +103,6 @@ def _extract_days_from_query(text: str, default: int = 30) -> int:
 
 
 def _guess_days_hebrew(text: str, default: int = 14) -> int:
-    """
-    עדכון מהיר למילים 'שבועיים' ו'שבוע' בשאלות טבעיות.
-    """
     t = (text or "").replace("?", "").replace("!", "").strip()
     if "שבועיים" in t:
         return 14
@@ -107,54 +111,201 @@ def _guess_days_hebrew(text: str, default: int = 14) -> int:
     return default
 
 
+def _has_hebrew(text: str) -> bool:
+    return bool(_re2.search(r"[\u0590-\u05FF]", text or ""))
+
+
+def _is_total_failures_query(text: str) -> bool:
+    t = (text or "").lower()
+    patterns = [
+        r"כמה\s+תקלות",
+        r"מספר\s+התקלות",
+        r"סה\"?כ\s+תקלות",
+        r"total\s+failures",
+        r"how\s+many\s+failures",
+    ]
+    return any(_re2.search(p, t) for p in patterns)
+
+
+# -------------------------------------------------
+# ניהול Session ומצב אורח (Guest Mode)
+# -------------------------------------------------
+
+def get_user_id():
+    """מייצר או שולף מזהה אורח ייחודי ושומר ב-Session"""
+    if "user_id" not in st.session_state:
+        # כאן נוצר ה-UUID למשתמש האורח
+        st.session_state.user_id = str(uuid.uuid4())
+    return st.session_state.user_id
+
+
+def init_chat_session():
+    if "current_chat_id" not in st.session_state:
+        st.session_state.current_chat_id = None  # None = שיחה חדשה שטרם נשמרה
+    if "chat" not in st.session_state:
+        st.session_state.chat = []
+
+    # אתחול הגדרות גלובליות אם חסרות
+    if "date" not in st.session_state:
+        st.session_state.date = date(2024, 12, 30)
+    if "top_limit" not in st.session_state:
+        st.session_state.top_limit = 10
+
+
+def load_chat_history(chat_id):
+    """טוען הודעות מה-DB לתוך ה-Session"""
+    st.session_state.current_chat_id = chat_id
+    st.session_state.chat = load_messages(chat_id)
+
+
+def start_new_chat():
+    """מאפס את המסך לשיחה חדשה"""
+    st.session_state.current_chat_id = None
+    st.session_state.chat = []
+
+
+# -------------------------------------------------
+# פונקציות צ'אט מעודכנות (עם שמירה ל-DB)
+# -------------------------------------------------
+
+def append_chat_message(role: str, text: str) -> dict[str, Any]:
+    """מוסיף הודעה ל-Session ושומר ל-DB אם יש שיחה פעילה"""
+    msg = {
+        "id": str(uuid.uuid4()),
+        "role": role,
+        "text": text,
+        "ts": dt.datetime.now().strftime("%H:%M"),
+        "tables": [],
+    }
+    st.session_state.chat.append(msg)
+
+    # שמירה ל-DB: רק אם כבר יש ID לשיחה.
+    # אם השיחה חדשה (None), השמירה תתבצע בפונקציה main אחרי שנקבע שם.
+    if st.session_state.current_chat_id:
+        save_message(st.session_state.current_chat_id, role, text)
+
+    return msg
+
+
+def say(text: str) -> None:
+    """פונקציית עזר לקיצור"""
+    append_chat_message("assistant", text)
+
+
 def add_table(title: str, df: pd.DataFrame) -> None:
     """
-    מוסיף טבלה להודעת ה-Agent האחרונה בצ'אט.
+    מוסיף טבלה להודעה האחרונה ב-UI, ושומר אותה ל-DB.
     """
-    if "chat" not in st.session_state or not st.session_state.chat:
+    if not st.session_state.chat:
         return
 
-    last_msg = st.session_state.chat[-1]
-    if last_msg.get("role") != "assistant":
-        # אם מסיבה כלשהי ההודעה האחרונה היא של המשתמש – לא נצרף
+    last_agent = None
+    for m in reversed(st.session_state.chat):
+        if m.get("role") == "assistant":
+            last_agent = m
+            break
+
+    if last_agent is None:
         return
 
-    tables = last_msg.setdefault("tables", [])
-    tables.append(
-        {
-            "id": str(uuid.uuid4()),
-            "title": title,
-            "df": df.copy(),
-        }
-    )
+    # 1. עדכון ב-UI
+    tables = last_agent.setdefault("tables", [])
+    table_obj = {
+        "id": str(uuid.uuid4()),
+        "title": title,
+        "df": df.copy(),
+    }
+    tables.append(table_obj)
+
+    # 2. שמירה ל-DB (Persistency)
+    # כדי לפשט, נשמור את הטבלה כ"הודעת מערכת" נפרדת או נעדכן.
+    # בחרתי לשמור כהודעה נוספת מאחורי הקלעים עם התוכן הטבלאי,
+    # כדי להבטיח שהיא תיטען מחדש.
+    if st.session_state.current_chat_id:
+        # אופציה: שולחים שוב את ההודעה האחרונה עם הטבלאות,
+        # או שומרים רשומה ייעודית. ב-db_chat.py יש תמיכה ב-tables.
+        # נבצע "תיקון" פשוט: נשמור רשומה עם טקסט ריק שמכילה את הטבלה.
+        save_message(st.session_state.current_chat_id, "assistant", "", tables=[table_obj])
 
 
-def render_all_tables() -> None:
-    """מציג את כל הטבלאות שנשמרו + כפתורי הורדה."""
-    for item in st.session_state.get("tables_store", []):
-        st.markdown(f"**{item['title']}**")
-        st.dataframe(
-            item["df"],
-            use_container_width=True,
-            height=320,
-            key=f"df_{item['id']}",
-        )
-        csv = item["df"].to_csv(index=False).encode("utf-8")
-        safe_name = f"{item['title'].replace(' ', '_')}.csv"
-        st.download_button(
-            "⬇️ הורד CSV",
-            csv,
-            file_name=safe_name,
-            key=f"dl_{item['id']}",
-        )
+def render_chat_message(msg: dict[str, Any]) -> None:
+    role = msg.get("role", "assistant")
+    text = msg.get("text", "")
+    ts = msg.get("ts", "")
+    tables = msg.get("tables", []) or []
 
+    is_he = _has_hebrew(text)
+    direction = "rtl" if is_he else "ltr"
+
+    if role == "user":
+        align = "right"
+        bg_color = "#d1e7dd"
+        border_color = "#0f5132"
+        label = "את/ה"
+        icon = "🧑‍💻"
+    else:
+        align = "left"
+        bg_color = "#f8f9fa"
+        border_color = "#6c757d"
+        label = "Agent"
+        icon = "🤖"
+
+    # דילוג על הודעות טכניות ריקות שנועדו רק לשמירת טבלאות
+    if not text and not tables:
+        return
+
+    # אם יש טקסט, נציג אותו
+    if text:
+        html = f"""
+        <div style="display: flex; justify-content: {align}; margin: 4px 0;">
+          <div style="
+              max-width: 90%;
+              background-color: {bg_color};
+              border: 1px solid {border_color};
+              border-radius: 12px;
+              padding: 8px 10px;
+              font-size: 0.95rem;
+              direction: {direction};
+              text-align: {'right' if direction == 'rtl' else 'left'};
+              box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+          ">
+            <div style="font-weight: 600; margin-bottom: 4px;">
+              {icon} {label}
+            </div>
+            <div>{text}</div>
+            <div style="
+                font-size: 0.75rem;
+                color: #6c757d;
+                margin-top: 4px;
+                text-align: {'left' if direction == 'rtl' else 'right'};
+            ">
+              {ts}
+            </div>
+          </div>
+        </div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+
+    # אם יש טבלאות, נציג אותן מתחת להודעה
+    if role == "assistant":
+        for t in tables:
+            st.markdown(f"**📊 {t['title']}**")
+            st.dataframe(
+                t["df"],
+                use_container_width=True,  # <--- התיקון: במקום width=None
+                height=320,
+                key=f"df_{t['id']}",  # מפתח ייחודי לסטרימליט
+            )
+            csv = t["df"].to_csv(index=False).encode("utf-8")
+            safe_name = f"{t['title'].replace(' ', '_')}.csv"
+            st.download_button(
+                "⬇️ הורד CSV",
+                csv,
+                file_name=safe_name,
+                key=f"dl_{t['id']}",
+            )
 
 def render_failures_matrix(detail: pd.DataFrame, title: str) -> None:
-    """
-    טבלה מסודרת של תקלות בפועל:
-    date, bus, failure_type, fault_category, failure_flag, maintenance_flag.
-    עם st-aggrid.
-    """
     if detail.empty:
         return
 
@@ -189,125 +340,16 @@ def render_failures_matrix(detail: pd.DataFrame, title: str) -> None:
     )
 
 
-import re as _re2
-
-
-def _has_hebrew(text: str) -> bool:
-    return bool(_re2.search(r"[\u0590-\u05FF]", text or ""))
-
-
-def render_chat_message(msg: dict[str, Any]) -> None:
-    """
-    מציג הודעת צ'אט כבועה, כולל שעה מתחת לטקסט
-    וטבלאות שקשורות להודעה (אם יש).
-    """
-    role = msg.get("role", "assistant")
-    text = msg.get("text", "")
-    ts = msg.get("ts", "")
-    tables = msg.get("tables", []) or []
-
-    is_he = _has_hebrew(text)
-    direction = "rtl" if is_he else "ltr"
-
-    if role == "user":
-        align = "right"
-        bg_color = "#d1e7dd"
-        border_color = "#0f5132"
-        label = "את/ה"
-        icon = "🧑‍💻"
-    else:
-        align = "left"
-        bg_color = "#f8f9fa"
-        border_color = "#6c757d"
-        label = "Agent"
-        icon = "🤖"
-
-    # בועת טקסט
-    html = f"""
-    <div style="display: flex; justify-content: {align}; margin: 4px 0;">
-      <div style="
-          max-width: 90%;
-          background-color: {bg_color};
-          border: 1px solid {border_color};
-          border-radius: 12px;
-          padding: 8px 10px;
-          font-size: 0.95rem;
-          direction: {direction};
-          text-align: {'right' if direction == 'rtl' else 'left'};
-          box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-      ">
-        <div style="font-weight: 600; margin-bottom: 4px;">
-          {icon} {label}
-        </div>
-        <div>{text}</div>
-        <div style="
-            font-size: 0.75rem;
-            color: #6c757d;
-            margin-top: 4px;
-            text-align: {'left' if direction == 'rtl' else 'right'};
-        ">
-          {ts}
-        </div>
-      </div>
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-
-    # טבלאות ששייכות להודעת Agent זו
-    if role == "assistant":
-        for t in tables:
-            st.markdown(f"**{t['title']}**")
-            st.dataframe(
-                t["df"],
-                width="stretch",
-                height=320,
-                key=f"df_{t['id']}",
-            )
-            csv = t["df"].to_csv(index=False).encode("utf-8")
-            safe_name = f"{t['title'].replace(' ', '_')}.csv"
-            st.download_button(
-                "⬇️ הורד CSV",
-                csv,
-                file_name=safe_name,
-                key=f"dl_{t['id']}",
-            )
-def append_chat_message(role: str, text: str) -> dict[str, Any]:
-    """יוצר אובייקט הודעה עם שעה ושומר אותו ב-session_state."""
-    if "chat" not in st.session_state:
-        st.session_state.chat: list[dict[str, Any]] = []
-    msg = {
-        "id": str(uuid.uuid4()),
-        "role": role,
-        "text": text,
-        "ts": dt.datetime.now().strftime("%H:%M"),  # שעה:דקה
-        "tables": [],  # כאן נצרף טבלאות להודעת Agent
-    }
-    st.session_state.chat.append(msg)
-    return msg
-
-
-def say(text: str) -> None:
-    """מוסיף הודעת עוזר לצ'אט ומציג אותה במסך."""
-    msg = append_chat_message("assistant", text)
-    render_chat_message(msg)
-
-
 # -------------------------------------------------
-# סיכום תקופה – מה קרה בשבוע / שבועיים / טווח טבעי
+# לוגיקה עסקית (Business Logic) - נשמר במלואו
 # -------------------------------------------------
 
-
-def handle_period_question(query: str, today: dt_date, intents: dict[str, Any]) -> None:
-    """
-    לוגיקה מרוכזת לשאלות כמו:
-    'מה קרה בשבועיים האחרונים', 'מה קרה בשבוע האחרון', 'מה קרה ב־X הימים האחרונים'
-    """
+def handle_period_question(query: str, today: date, intents: dict[str, Any]) -> None:
     rng = intents.get("RESOLVED_RANGE")
 
     if rng:
         start, end, title = rng
     else:
-        # אם אין טווח מפורש – ננחש ימים מהשאלה / INTENT
         days = intents.get("DAYS")
         if not days:
             days = _extract_days_from_query(query, default=14)
@@ -316,7 +358,6 @@ def handle_period_question(query: str, today: dt_date, intents: dict[str, Any]) 
         start = today - timedelta(days=days - 1)
         title = f"{days} הימים האחרונים"
 
-    # ולידציה מול סימולציה ודאטה
     if end > today:
         say(
             f"הטווח שביקשת ({title}) כולל תאריכים אחרי תאריך הסימולציה ({today}). "
@@ -340,7 +381,6 @@ def handle_period_question(query: str, today: dt_date, intents: dict[str, Any]) 
         say(f"לא נמצאו נתונים בטווח: {title}.")
         return
 
-    # ----- KPI בסיסיים -----
     n_buses = risk["bus_id"].nunique() if not risk.empty else 0
     n_buses_high_risk = (
         risk.loc[risk["proba_7d"] >= 0.5, "bus_id"].nunique() if not risk.empty else 0
@@ -355,20 +395,24 @@ def handle_period_question(query: str, today: dt_date, intents: dict[str, Any]) 
     c3.metric("סה\"כ רשומות תחזית", total_preds)
     c4.metric("סה\"כ תקלות בפועל", total_failures)
 
-    # ----- מגמת סיכון לאורך הזמן -----
+    summary_text = None
     if not trend.empty:
-        add_table(f"מגמות סיכון ({title})", trend)
         first, last = trend.iloc[0]["pct_risk"], trend.iloc[-1]["pct_risk"]
         delta = last - first
         direction = "עלייה" if delta >= 0 else "ירידה"
-        say(
-            paraphrase_he(
-                f"במהלך {title} נראית {direction} בשיעור האוטובוסים בסיכון: "
-                f"מ־{first:.1f}% ל־{last:.1f}%."
-            )
+        summary_text = paraphrase_he(
+            f"במהלך {title} נראית {direction} בשיעור האוטובוסים בסיכון: "
+            f"מ־{first:.1f}% ל־{last:.1f}%."
         )
+    elif not (risk.empty and detail.empty):
+        summary_text = f"הצגתי סיכום תקלות וסיכונים עבור {title}."
 
-    # ----- טבלת סיכום לפי אוטובוס ויום (מתחזיות) -----
+    if summary_text:
+        say(summary_text)
+
+    if not trend.empty:
+        add_table(f"מגמות סיכון ({title})", trend)
+
     if not risk.empty:
         cols = [
             "d",
@@ -383,37 +427,57 @@ def handle_period_question(query: str, today: dt_date, intents: dict[str, Any]) 
         cols = [c for c in cols if c in risk.columns]
         risk_sorted = risk.sort_values("proba_7d", ascending=False)
         add_table(
-            f"סיכום לפי אוטובוס ויום ({title}) – Top 100 לפי סיכון לשבוע",
+            f"סיכון לשבוע לכל יום ואוטובוס — Top 100 ({title})",
             risk_sorted[cols].head(100),
         )
 
-    # ----- מטריקס תקלות בפועל לפי יום ואוטובוס -----
     if not detail.empty:
         render_failures_matrix(detail, title="פירוט תקלות בפועל לפי יום ואוטובוס")
 
-    if trend.empty and not (risk.empty and detail.empty):
-        # אין מגמה, אבל יש נתונים – נציין סיכום קצר
-        say(f"הצגתי סיכום תקלות וסיכונים עבור {title}.")
 
-
-# -------------------------------------------------
-# לוגיקת המענה (Agent)
-# -------------------------------------------------
-
-
-def answer(query: str):
-    today: dt_date = st.session_state.date
+def answer(query: str) -> None:
+    today: date = st.session_state.date
     intents = detect_intents(query, today, st.session_state.top_limit)
     log_agent("Detected intents", **intents)
     top_n = intents.get("TOP_N", st.session_state.top_limit)
 
-    # ✅ מקרה מיוחד: "מי בסיכון לתקלות במזגן/בלמים" וכו'
+    # 1. שאלה על סך כל התקלות עד כה
+    if _is_total_failures_query(query):
+        with fancy_spinner("סופר את כל התקלות במערכת עד תאריך הסימולציה..."):
+            detail = df_failures_by_day_detail(SIM_MIN_DATE, today)
+
+        total_failures = len(detail)
+
+        if total_failures == 0:
+            say(
+                f"לא נמצאו תקלות מתועדות במערכת בין {SIM_MIN_DATE} לבין {today}."
+            )
+        else:
+            say(
+                paraphrase_he(
+                    f"נמצאו בסך הכול {total_failures} תקלות מתועדות בכל התקופה "
+                    f"עד תאריך הסימולציה {today}."
+                )
+            )
+            # סיכום לפי אוטובוס
+            summary_bus = (
+                detail.groupby("bus_id")
+                .size()
+                .reset_index(name="failures_count")
+                .sort_values("failures_count", ascending=False)
+            )
+            add_table(
+                f"סך תקלות לפי אוטובוס עד {today}",
+                summary_bus,
+            )
+        return
+
     fault_cats = map_likely_faults_from_query(query)
     if fault_cats and _is_risk_query(query):
         days = _extract_days_from_query(query, default=30)
         with fancy_spinner(
-            f"מחשב את האוטובוסים עם הסיכון הגבוה ביותר לתקלות בקטגוריות {', '.join(fault_cats)} "
-            f"ב-{days} הימים האחרונים..."
+                f"מחשב את האוטובוסים עם הסיכון הגבוה ביותר לתקלות בקטגוריות {', '.join(fault_cats)} "
+                f"ב-{days} הימים האחרונים..."
         ):
             df = df_high_risk_by_likely_fault(today, days, fault_cats, top_n)
 
@@ -423,23 +487,26 @@ def answer(query: str):
                 f"{', '.join(fault_cats)} ב-{days} הימים האחרונים בדאטה."
             )
         else:
+            say(
+                f"הנה האוטובוסים עם הסיכון הגבוה ביותר לתקלות בקטגוריות "
+                f"{', '.join(fault_cats)} ב-{days} הימים האחרונים."
+            )
             title = (
                 f"Top {top_n} אוטובוסים בסיכון גבוה "
                 f"({', '.join(fault_cats)}) ב-{days} הימים האחרונים"
             )
             add_table(title, df)
-            say("הצגתי את האוטובוסים עם הסיכון הגבוה ביותר לפי סוגי התקלות שביקשת.")
         return
 
-    # מי בסיכון היום (לכל התקלות)
     if intents.get("WHO_AT_RISK_TODAY"):
         with fancy_spinner("מביא את האוטובוסים בסיכון היום..."):
             df = df_at_risk_today(today, top_n)
         if df.empty:
             say(f"לא נמצאו אוטובוסים עם סיכון ≥ 50% בתאריך {today}.")
         else:
+            say("אלה האוטובוסים שנמצאים היום בסיכון גבוה (≥50%).")
             add_table(
-                f"מי בסיכון היום (≥50%) — {today}",
+                f"{today} — מי בסיכון היום (≥50%)",
                 df[
                     [
                         "bus_id",
@@ -454,10 +521,8 @@ def answer(query: str):
                     ]
                 ],
             )
-            say("סיכום יומי הוצג.")
         return
 
-    # כל התקלות בפועל לאוטובוס מסוים
     if intents.get("BUS_ALL_FAILURES") and intents.get("BUS_ID"):
         bus_id = intents["BUS_ID"]
         nice_id = pretty_bus_id(bus_id)
@@ -468,6 +533,7 @@ def answer(query: str):
         if df_hist.empty:
             say(f"לא מצאתי תקלות מתועדות עבור {nice_id} בכל התקופה.")
         else:
+            say(f"הנה כל התקלות של {nice_id} בכל התקופה.")
             add_table(
                 f"כל התקלות של {nice_id}",
                 df_hist[
@@ -481,15 +547,12 @@ def answer(query: str):
                     ]
                 ],
             )
-            say(f"הצגתי טבלה עם כל התקלות של {nice_id} בכל התקופה.")
         return
 
-    # BUS ספציפי – מצב היום / היסטוריה מהתחזיות
     if intents.get("BUS_ID"):
         bus_id = intents["BUS_ID"]
         nice_id = pretty_bus_id(bus_id)
 
-        # בדיקה אם המשתמש ביקש "כל התקלות" בהקשר של המודל
         want_all_failures_model = bool(
             _re2.search(r"כל\s+התקלות|כל\s+התקולות|all\s+failures", query, _re2.IGNORECASE)
         )
@@ -501,6 +564,7 @@ def answer(query: str):
             if dfb.empty:
                 say(f"לא נמצאו נתוני תחזיות היסטוריים עבור {nice_id}.")
             else:
+                say(f"הנה היסטוריית תחזיות/סיכונים עבור {nice_id}.")
                 add_table(
                     f"{nice_id} — היסטוריית תחזיות",
                     dfb[
@@ -519,16 +583,21 @@ def answer(query: str):
                         ]
                     ],
                 )
-                say("הצגתי היסטוריה של תחזיות/סיכונים לאוטובוס הזה.")
             return
 
-        # ברירת מחדל – מצב היום בלבד
         with fancy_spinner(f"מחשב סיכון עבור {nice_id}..."):
             dfb = df_bus_today(today, bus_id)
 
         if dfb.empty:
             say(f"לא נמצאו נתונים עבור {nice_id} בתאריך {today}.")
         else:
+            r = dfb.iloc[0]
+            msg = paraphrase_he(
+                f"**{nice_id} — {today}**: p7={r.proba_7d:.3f}"
+                + (f", p30={r.proba_30d:.3f}" if pd.notnull(r.proba_30d) else "")
+                + f". {r.explanation_he}"
+            )
+            say(msg)
             add_table(
                 f"{nice_id} — פירוט {today}",
                 dfb[
@@ -547,35 +616,27 @@ def answer(query: str):
                     ]
                 ],
             )
-            r = dfb.iloc[0]
-            msg = paraphrase_he(
-                f"**{nice_id} — {today}**: p7={r.proba_7d:.3f}"
-                + (f", p30={r.proba_30d:.3f}" if pd.notnull(r.proba_30d) else "")
-                + f". {r.explanation_he}"
-            )
-            say(msg)
         return
 
-    # החלקים שהוחלפו הכי הרבה בחודש האחרון
     if intents.get("MOST_REPLACED_PARTS"):
         with fancy_spinner("סורק החלפות חלקים בחודש האחרון..."):
             dfp = df_parts_replaced_last_30d(today, 20)
         if dfp.empty:
             say("לא נמצאו החלפות חלקים בחודש האחרון.")
         else:
+            top = dfp.iloc[0]
+            say(
+                paraphrase_he(
+                    f'החלק שהוחלף הכי הרבה בחודש האחרון הוא {top.part_name} '
+                    f'(סה\"כ {int(top.replaced_count)} החלפות). הצגתי גם טבלה מלאה.'
+                )
+            )
             add_table(
                 f"החלקים שהוחלפו הכי הרבה — 30 יום אחרונים עד {today}",
                 dfp,
             )
-            top = dfp.iloc[0]
-            say(
-                paraphrase_he(
-                    f'החלק שהוחלף הכי הרבה בחודש האחרון: {top.part_name} (סה"כ {int(top.replaced_count)} החלפות).'
-                )
-            )
         return
 
-    # אוטובוסים עם הכי הרבה תקלות בפועל
     if intents.get("BUS_MOST_FAILURES"):
         rng = intents.get("RESOLVED_RANGE")
         if rng:
@@ -597,21 +658,21 @@ def answer(query: str):
                 msg += f" בטווח {title}"
             say(msg + ".")
         else:
+            top_row = df.iloc[0]
+            say(
+                paraphrase_he(
+                    f"האוטובוס עם הכי הרבה תקלות הוא {top_row.bus_id} "
+                    f"עם {int(top_row.failure_count)} תקלות מתועדות בתקופה {title}. "
+                    f"הצגתי גם טבלת Top {top_n}."
+                )
+            )
             title_str = "אוטובוסים עם הכי הרבה תקלות"
             if ft_list:
                 title_str += f" ({', '.join(ft_list)})"
             title_str += f" - {title}"
             add_table(title_str, df)
-            top_row = df.iloc[0]
-            say(
-                paraphrase_he(
-                    f"האוטובוס עם הכי הרבה תקלות הוא {top_row.bus_id} "
-                    f"עם {int(top_row.failure_count)} תקלות מתועדות בתקופה {title}."
-                )
-            )
         return
 
-    # טווח טבעי / "מה קרה בשבוע / בשבועיים האחרונים"
     if intents.get("ANY_NATURAL_RANGE") or intents.get("WHAT_HAPPENED_LAST_DAYS"):
         handle_period_question(query, today, intents)
         return
@@ -619,10 +680,10 @@ def answer(query: str):
     # Top N היום (סיכון גבוה ביותר)
     if intents.get("TOP_LIST") or intents.get("HIGHEST_RISK_N"):
         n = intents.get("TOP_N", intents.get("TOP_N_TEXT", st.session_state.top_limit))
-        with fancy_spinner(f"מחשב Top {n} לסיכון היום..."):
-            df = df_at_risk_today(today, n)
+        with fancy_spinner(f"מחשב Top {n} לסיכון היום (ללא סף מינימלי)..."):
+            df = df_top_risk_today(today, n)
         if df.empty:
-            say(f"לא נמצאו נתונים ל-{today}.")
+            say(f"לא נמצאו נתונים ל־{today}.")
         else:
             add_table(
                 f"Top {n} Highest Risk — {today}",
@@ -643,7 +704,6 @@ def answer(query: str):
             say("הצגתי את האוטובוסים עם הסיכון הגבוה ביותר היום.")
         return
 
-    # Fallback Agent – שאילתא כללית
     with fancy_spinner("🤖🌀 הסוכן חושב ומרכיב שאילתה..."):
         used = run_fallback_agent(
             query,
@@ -660,11 +720,11 @@ def answer(query: str):
                 "אבל לא נמצאו נתונים שמתאימים לקריטריונים."
             )
         else:
+            say("פענחתי את הבקשה בעזרת הסוכן והצגתי טבלה מתאימה.")
             add_table(
                 shared_state.LAST_AGENT_TITLE or "תוצאה (Agent)",
                 df,
             )
-            say("פענחתי את הבקשה בעזרת הסוכן והצגתי טבלה מתאימה.")
         return
 
     say(
@@ -675,72 +735,97 @@ def answer(query: str):
 
 
 # -------------------------------------------------
-# main – נקודת כניסה אחת
+# Main / Layout
 # -------------------------------------------------
 
-
 def main() -> None:
-    # אתחול state
-    if "chat" not in st.session_state:
-        st.session_state.chat: list[dict[str, Any]] = []
-    if "date" not in st.session_state:
-        st.session_state.date = dt_date(2024, 12, 30)
-    if "top_limit" not in st.session_state:
-        st.session_state.top_limit = 10
+    user_id = get_user_id()
+    init_chat_session()
 
-    # Sidebar
+    # --- Sidebar: היסטוריה והגדרות ---
     with st.sidebar:
+        st.title("🗄️ היסטוריית שיחות")
+        if st.button("➕ שיחה חדשה", use_container_width=True):
+            start_new_chat()
+            st.rerun()
+
+        st.markdown("---")
+
+        # רשימת השיחות של המשתמש
+        my_chats = list_conversations(user_id)
+        for c in my_chats:
+            label = c['title']
+            if c['id'] == st.session_state.current_chat_id:
+                label = f"🔹 {label}"
+
+            if st.button(label, key=c['id'], use_container_width=True):
+                load_chat_history(c['id'])
+                st.rerun()
+
+        st.markdown("---")
+
+        # הגדרות
         st.subheader("הגדרות")
         st.session_state.date = st.date_input(
             "📅 תאריך סימולציה:",
             value=st.session_state.date,
             min_value=date(2023, 1, 1),
-            max_value=date(2024, 12, 31)
+            max_value=date(2024, 12, 31),
         )
         st.session_state.top_limit = st.number_input(
-            "Top N (לרשימות או LIMIT לסוכן):",
-            1,
-            500,
-            st.session_state.top_limit,
-            1,
+            "Top N / Limit:",
+            min_value=1,
+            max_value=10000,
+            value=st.session_state.top_limit,
+            step=1,
         )
-        st.caption(
-            "✅ OpenAI key loaded"
-            if OPENAI_API_KEY
-            else "ℹ️ ללא OpenAI (ניסוח בסיסי בלבד)"
-        )
+
         st.markdown("---")
-        if st.button("🧹 נקה טבלאות מוצגות", width="stretch"):
-            if "chat" in st.session_state:
-                for m in st.session_state.chat:
-                    if "tables" in m:
-                        m["tables"] = []
-            st.success("נוקו הטבלאות מהתצוגה.")
+        if st.button("🧹 נקה תצוגה (מקומי)", use_container_width=True):
+            st.session_state.chat = []
+            st.success("נוקתה התצוגה.")
 
-    # כותרת + הסבר
-    st.markdown("### 🚌 תחזוקה חכמה — Agent (Modular)")
-    st.info(
-        "דוגמאות: “מי בסיכון היום?”, “BUS 17 / אוטובוס 9”, "
-        "“איזה חלקים הוחלפו הכי הרבה?”, “מה קרה בשבוע האחרון?”, "
-        "“לאיזה אוטובוס היו הכי הרבה תקלות במזגן בשבוע האחרון?”."
-    )
+    # --- Main Chat Area ---
 
-    # הצגת 10 ההודעות האחרונות
-    for m in st.session_state.chat[-10:]:
+    # מחקנו מכאן את החלק של עריכת הכותרת ("שם השיחה" + "שמור")
+
+    if st.session_state.current_chat_id is None:
+        st.markdown("### 🚌 התחל שיחה חדשה")
+
+    # תצוגת היסטוריית ההודעות הקיימות
+    for m in st.session_state.chat:
         render_chat_message(m)
 
-    st.markdown("---")
-
-    # קלט מהמשתמש
+    # קלט המשתמש
     user_msg = st.chat_input(
-        "שאלה (עברית/English). אפשר BUS, 'מי בסיכון', 'חלקים הוחלפו', 'Top', 'מה קרה', 'הכי הרבה תקלות'."
+        "שאלה (עברית/English)...",
+        key="agent_input"
     )
+
     if user_msg:
-        msg = append_chat_message("user", user_msg)
-        render_chat_message(msg)
+        # 1. שמירה ב-State + DB
+        msg_obj = append_chat_message("user", user_msg)
+
+        # --- התיקון לבעיה מס' 2 ---
+        # אנחנו מציירים את ההודעה החדשה מיד, ידנית,
+        # כדי שהמשתמש יראה אותה בזמן שהסוכן חושב
+        render_chat_message(msg_obj)
+        # ---------------------------
+
+        # 2. טיפול בשיחה חדשה (יצירת ID וכותרת)
+        if st.session_state.current_chat_id is None:
+            auto_title = generate_chat_title(user_msg)
+            new_id = create_conversation(user_id, auto_title)
+            st.session_state.current_chat_id = new_id
+            # שומרים רטרואקטיבית את ההודעה הראשונה ל-DB
+            save_message(new_id, "user", user_msg)
+
+        # 3. חישוב התשובה (בזמן הזה ההודעה של המשתמש כבר מוצגת)
         with fancy_spinner("מבצע את הבקשה..."):
             answer(user_msg)
 
+        # 4. רענון סופי להצגת התשובה
+        st.rerun()
 
 
 if __name__ == "__main__":

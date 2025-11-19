@@ -1,79 +1,168 @@
 {
   "schema": "public",
   "edges": [
-    {"fk_name": "bridge_fault_part_fault_id_fkey","to_table": "dim_fault","to_column": "fault_id","from_table": "bridge_fault_part","from_column": "fault_id"},
-    {"fk_name": "bridge_fault_part_part_id_fkey","to_table": "dim_part","to_column": "part_id","from_table": "bridge_fault_part","from_column": "part_id"},
-    {"fk_name": "fk_dim_failure_cost_to_dim_fault_name","to_table": "dim_fault","to_column": "failure_type","from_table": "dim_failure_cost","from_column": "failure_type"},
-    {"fk_name": "fact_bus_predictions_star_bus_sk_fkey","to_table": "dim_bus_star","to_column": "bus_sk","from_table": "fact_bus_predictions_star","from_column": "bus_sk"},
-    {"fk_name": "fact_bus_predictions_star_date_id_fkey","to_table": "dim_date","to_column": "date_id","from_table": "fact_bus_predictions_star","from_column": "date_id"},
-    {"fk_name": "fact_bus_status_star_bus_sk_fkey","to_table": "dim_bus_star","to_column": "bus_sk","from_table": "fact_bus_status_star","from_column": "bus_sk"},
-    {"fk_name": "fact_bus_status_star_date_id_fkey","to_table": "dim_date","to_column": "date_id","from_table": "fact_bus_status_star","from_column": "date_id"},
-    {"fk_name": "fact_bus_status_star_fault_id_fkey","to_table": "dim_fault","to_column": "fault_id","from_table": "fact_bus_status_star","from_column": "fault_id"},
-    {"fk_name": "fk_ml_costed_preds_to_map_bus_physical","to_table": "map_bus_physical","to_column": "bus_id","from_table": "ml_costed_predictions_physical","from_column": "bus_id"},
-    {"fk_name": "fk_ml_costed_preds_to_dim_date","to_table": "dim_date","to_column": "date_id","from_table": "ml_costed_predictions_physical","from_column": "date"},
-    {"fk_name": "fk_ml_current_risk_to_map_bus_physical","to_table": "map_bus_physical","to_column": "bus_id","from_table": "ml_current_risk_physical","from_column": "bus_id"},
-    {"fk_name": "fk_ml_preds_daily_to_map_bus_physical","to_table": "map_bus_physical","to_column": "bus_id","from_table": "ml_predictions_daily_physical","from_column": "bus_id"},
-    {"fk_name": "fk_ml_preds_daily_to_dim_date","to_table": "dim_date","to_column": "date_id","from_table": "ml_predictions_daily_physical","from_column": "date"}
+    {
+      "fk_name": "bridge_fault_part_fault_id_fkey",
+      "to_table": "dim_fault",
+      "to_column": "fault_id",
+      "from_table": "bridge_fault_part",
+      "from_column": "fault_id"
+    },
+    {
+      "fk_name": "bridge_fault_part_part_id_fkey",
+      "to_table": "dim_part",
+      "to_column": "part_id",
+      "from_table": "bridge_fault_part",
+      "from_column": "part_id"
+    },
+    {
+      "fk_name": "fk_dim_failure_cost_to_dim_fault_name",
+      "to_table": "dim_fault",
+      "to_column": "failure_type",
+      "from_table": "dim_failure_cost",
+      "from_column": "failure_type"
+    },
+    {
+      "fk_name": "fact_bus_predictions_star_bus_sk_fkey",
+      "to_table": "dim_bus_star",
+      "to_column": "bus_sk",
+      "from_table": "fact_bus_predictions_star",
+      "from_column": "bus_sk"
+    },
+    {
+      "fk_name": "fact_bus_predictions_star_date_id_fkey",
+      "to_table": "dim_date",
+      "to_column": "date_id",
+      "from_table": "fact_bus_predictions_star",
+      "from_column": "date_id"
+    },
+    {
+      "fk_name": "fact_bus_status_star_bus_sk_fkey",
+      "to_table": "dim_bus_star",
+      "to_column": "bus_sk",
+      "from_table": "fact_bus_status_star",
+      "from_column": "bus_sk"
+    },
+    {
+      "fk_name": "fact_bus_status_star_date_id_fkey",
+      "to_table": "dim_date",
+      "to_column": "date_id",
+      "from_table": "fact_bus_status_star",
+      "from_column": "date_id"
+    },
+    {
+      "fk_name": "fact_bus_status_star_fault_id_fkey",
+      "to_table": "dim_fault",
+      "to_column": "fault_id",
+      "from_table": "fact_bus_status_star",
+      "from_column": "fault_id"
+    },
+    {
+      "fk_name": "fk_ml_costed_preds_to_map_bus_physical",
+      "to_table": "map_bus_physical",
+      "to_column": "bus_id",
+      "from_table": "ml_costed_predictions_physical",
+      "from_column": "bus_id"
+    },
+    {
+      "fk_name": "fk_ml_costed_preds_to_dim_date",
+      "to_table": "dim_date",
+      "to_column": "date_id",
+      "from_table": "ml_costed_predictions_physical",
+      "from_column": "date"
+    },
+    {
+      "fk_name": "fk_ml_current_risk_to_map_bus_physical",
+      "to_table": "map_bus_physical",
+      "to_column": "bus_id",
+      "from_table": "ml_current_risk_physical",
+      "from_column": "bus_id"
+    },
+    {
+      "fk_name": "fk_ml_preds_daily_to_map_bus_physical",
+      "to_table": "map_bus_physical",
+      "to_column": "bus_id",
+      "from_table": "ml_predictions_daily_physical",
+      "from_column": "bus_id"
+    },
+    {
+      "fk_name": "fk_ml_preds_daily_to_dim_date",
+      "to_table": "dim_date",
+      "to_column": "date_id",
+      "from_table": "ml_predictions_daily_physical",
+      "from_column": "date"
+    }
   ],
   "tables": {
     "dim_bus_star": {
       "columns": [
-        {"name": "bus_sk","type": "bigint"},
-        {"name": "bus_id","type": "text"},
-        {"name": "region_types","type": "text"}
+        { "name": "bus_sk", "type": "bigint" },
+        { "name": "bus_id", "type": "text" },
+        { "name": "region_types", "type": "text" }
       ]
     },
     "dim_fault": {
       "columns": [
-        {"name": "fault_id","type": "bigint"},
-        {"name": "failure_type","type": "text"},
-        {"name": "fault_category","type": "text"}
+        { "name": "fault_id", "type": "bigint" },
+        { "name": "failure_type", "type": "text" },
+        { "name": "fault_category", "type": "text" }
       ]
     },
     "dim_part": {
       "columns": [
-        {"name": "part_id","type": "bigint"},
-        {"name": "part_name","type": "text"}
+        { "name": "part_id", "type": "bigint" },
+        { "name": "part_name", "type": "text" }
       ]
     },
     "dim_date": {
       "columns": [
-        {"name": "date_id","type": "date"},
-        {"name": "year","type": "integer"},
-        {"name": "month","type": "smallint"},
-        {"name": "quarter","type": "smallint"}
+        { "name": "date_id", "type": "date" },
+        { "name": "year", "type": "integer" },
+        { "name": "month", "type": "smallint" },
+        { "name": "quarter", "type": "smallint" }
       ]
     },
+"fact_bus_daily": {
+  "columns": [
+    { "name": "bus_id",               "type": "text" },
+    { "name": "date",                 "type": "text" },
+    { "name": "region_type",          "type": "text" },
+    { "name": "trip_distance_km",     "type": "double precision" },
+    { "name": "avg_speed_kmh",        "type": "double precision" },
+    { "name": "passengers_avg",       "type": "bigint" },
+    { "name": "temperature_avg_c",    "type": "double precision" },
+    { "name": "engine_hours_total",   "type": "double precision" },
+    { "name": "mileage_total_km",     "type": "bigint" },
+    { "name": "failure_type",         "type": "text" },
+    { "name": "maintenance_date",     "type": "text" },
+    { "name": "failure_flag",         "type": "bigint" },
+    { "name": "maintenance_flag",     "type": "bigint" },
+    { "name": "season",               "type": "text" },
+    { "name": "region_geo",           "type": "character varying" },
+    { "name": "temperature_synthetic","type": "real" }
+  ]
+},
+
     "fact_bus_status_star": {
       "columns": [
-        {"name": "fact_id","type": "bigint"},
-        {"name": "bus_sk","type": "bigint"},
-        {"name": "date_id","type": "date"},
-        {"name": "fault_id","type": "bigint"},
-        {"name": "failure_flag","type": "boolean"},
-        {"name": "maintenance_flag","type": "boolean"}
+        { "name": "fact_id", "type": "bigint" },
+        { "name": "bus_sk", "type": "bigint" },
+        { "name": "date_id", "type": "date" },
+        { "name": "fault_id", "type": "bigint" },
+        { "name": "failure_flag", "type": "boolean" },
+        { "name": "maintenance_flag", "type": "boolean" }
       ]
     },
     "predictions_for_powerbi": {
       "columns": [
-        {"name": "bus_id","type": "text"},
-        {"name": "date","type": "text"},
-        {"name": "proba_7d","type": "double precision"},
-        {"name": "label_7d","type": "bigint"},
-        {"name": "proba_30d","type": "double precision"},
-        {"name": "label_30d","type": "bigint"},
-        {"name": "failure_reason","type": "text"},
-        {"name": "likely_fault","type": "text"}
-      ]
-    },
-    "vw_preds_costed_final": {
-      "columns": [
-        {"name": "bus_id","type": "text"},
-        {"name": "date","type": "date"},
-        {"name": "predicted_proba","type": "double precision"},
-        {"name": "predicted_label","type": "smallint"},
-        {"name": "failure_type_canon","type": "text"},
-        {"name": "expected_cost_usd","type": "numeric"}
+        { "name": "bus_id", "type": "text" },
+        { "name": "date", "type": "text" },
+        { "name": "proba_7d", "type": "double precision" },
+        { "name": "label_7d", "type": "bigint" },
+        { "name": "proba_30d", "type": "double precision" },
+        { "name": "label_30d", "type": "bigint" },
+        { "name": "failure_reason", "type": "text" },
+        { "name": "likely_fault", "type": "text" }
       ]
     }
   }
