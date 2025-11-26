@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sqlalchemy import text
 
 import json
 import re
@@ -208,11 +209,11 @@ def df_parts_replaced_last_30d(end_date: date, limit: int) -> pd.DataFrame:
     return q(SQL_PARTS_REPLACED_LAST_30D, {"start": start, "end": end, "limit": limit})
 
 
-def df_failures_by_day_detail(start: date, end: date) -> pd.DataFrame:
+def df_failures_by_day_detail(start: date, end: date, season: str = None) -> pd.DataFrame:
     """
-    מחזיר לכל יום אילו אוטובוסים חוו תקלות בפועל ומה סוג התקלה.
+    פירוט תקלות בפועל (Fact Table) עם סינון עונתי.
     """
-    sql = """
+    sql = f"""
     SELECT
         f.date_id::date AS d,
         b.bus_id,
@@ -223,12 +224,16 @@ def df_failures_by_day_detail(start: date, end: date) -> pd.DataFrame:
     FROM public.fact_bus_status_star f
     JOIN public.dim_bus_star   b   ON f.bus_sk  = b.bus_sk
     LEFT JOIN public.dim_fault dft ON f.fault_id = dft.fault_id
+    LEFT JOIN public.dim_date  dd  ON f.date_id = dd.date_id
     WHERE f.date_id BETWEEN :start AND :end
       AND (COALESCE(f.failure_flag, FALSE) = TRUE OR f.fault_id IS NOT NULL)
+      { "AND dd.season = :season" if season else "" }
     ORDER BY d, b.bus_id
     """
-    return q(sql, {"start": start, "end": end})
-
+    params = {"start": start, "end": end}
+    if season:
+        params["season"] = season
+    return q(sql, params)
 
 def df_bus_all_failures(bus_id: str) -> pd.DataFrame:
     """
@@ -253,9 +258,30 @@ def df_bus_all_failures(bus_id: str) -> pd.DataFrame:
     return q(sql, {"bus": bus_id})
 
 
-def df_trend_last_days(start: date, end: date) -> pd.DataFrame:
-    return q(SQL_TREND_LAST_DAYS, {"start": start, "end": end})
-
+def df_trend_last_days(start: date, end: date, season: str = None) -> pd.DataFrame:
+    """
+    מחזיר נתוני מגמה (Trend) עם תמיכה בסינון עונתי.
+    """
+    # JOIN ל-dim_date כדי לסנן לפי עונה
+    sql = f"""
+    SELECT
+        p.date::date AS d,
+        COUNT(*) FILTER (WHERE p.proba_7d >= 0.5)                  AS at_risk,
+        AVG(p.proba_7d)                                            AS avg_proba,
+        100.0 * COUNT(*) FILTER (WHERE p.proba_7d >= 0.5)
+            / NULLIF(COUNT(*), 0)                                  AS pct_risk,
+        COUNT(*)                                                   AS total_buses
+    FROM {PRED_SRC}
+    LEFT JOIN public.dim_date dd ON p.date::date = dd.date_id
+    WHERE p.date::date BETWEEN :start AND :end
+      { "AND dd.season = :season" if season else "" }
+    GROUP BY 1
+    ORDER BY 1
+    """
+    params = {"start": start, "end": end}
+    if season:
+        params["season"] = season
+    return q(sql, params)
 
 def df_bus_most_failures(
     start: Optional[date],
@@ -334,10 +360,9 @@ def df_high_risk_by_likely_fault(
     return _enrich_with_human_explanation(df, prob_col="proba_7d")
 
 
-def df_risk_summary_by_day_bus(start: date, end: date) -> pd.DataFrame:
+def df_risk_summary_by_day_bus(start: date, end: date, season: str = None) -> pd.DataFrame:
     """
-    סיכום תחזיות לפי יום ואוטובוס:
-    תאריך, אוטובוס, proba_7d, proba_30d, label_7d/30d, הסבר בעברית.
+    הטבלה ה'מורכבת': תחזיות, הסתברויות, סיבות והסברים לכל יום ואוטובוס.
     """
     sql = f"""
     SELECT
@@ -350,23 +375,35 @@ def df_risk_summary_by_day_bus(start: date, end: date) -> pd.DataFrame:
         p.failure_reason,
         p.likely_fault
     FROM {PRED_SRC}
+    LEFT JOIN public.dim_date dd ON p.date::date = dd.date_id
     WHERE p.date::date BETWEEN :start AND :end
+      {"AND dd.season = :season" if season else ""}
     ORDER BY d, p.bus_id
     """
-    df = q(sql, {"start": start, "end": end})
+    params = {"start": start, "end": end}
+    if season:
+        params["season"] = season
+
+    df = q(sql, params)
 
     if df.empty:
         return df
 
-    df = _enrich_with_human_explanation(df, prob_col="proba_7d")
+    # הוספת הסברים מילוליים
+    if "failure_reason" in df.columns:
+        df["reason_he"] = df["failure_reason"].apply(humanize_reason_he)
+    if "likely_fault" in df.columns:
+        df["where_he"] = df["likely_fault"].apply(where_from_likely_fault)
 
-    # דגל אם בפועל היתה תקלה באחד האופקים
+    # שימוש בפונקציית העזר הקיימת להוספת ההסבר המלא
+    # הערה: ודא ש-add_row_explanation מיובאת בראש הקובץ
+    df = add_row_explanation(df, prob_col="proba_7d")
+
     df["had_failure"] = (
-        df["label_7d"].fillna(0).astype(int).astype(bool)
-        | df["label_30d"].fillna(0).astype(int).astype(bool)
+            df["label_7d"].fillna(0).astype(int).astype(bool)
+            | df["label_30d"].fillna(0).astype(int).astype(bool)
     )
     return df
-
 
 # =========================
 # בדיקת בטיחות שאילתות ל LLM
@@ -447,125 +484,192 @@ def _force_limit_param(sql: str) -> str:
 # LLM planner
 # =========================
 
-PLAN_SYSTEM_PROMPT = f"""
-You are a cautious SQL planner for a predictive bus maintenance app.
+# בתוך agent_queries.py
 
-You MUST base all queries ONLY on the schema listed below.
-If the schema does not contain the requested data, you MUST NOT invent columns or tables.
+PLAN_SYSTEM_PROMPT = """
+You are an ultra-strict SQL planner for a predictive bus maintenance analytics agent.
 
-=== Logical data model (PostgreSQL) ===
+You MUST generate SQL ONLY based on the schema listed below.
+If a column or table is not listed — you MUST NOT use it.
+All SQL must run on PostgreSQL exactly as generated.
 
-Key tables:
+====================================================================
+1. VERIFIED DATABASE SCHEMA (FROM LIVE DB)
+====================================================================
 
-1. public.predictions_for_powerbi
-   - One row per (bus_id, date).
-   - Columns:
-     - bus_id (text)
-     - date (text, castable to date)
-     - proba_7d, label_7d  –  7-day failure prediction
-     - proba_30d, label_30d – 30-day failure prediction
-     - failure_reason (text)
-     - likely_fault (text)
-   - Use this when the user asks about predicted risk / probability / labels.
+=== A. fact_bus_status_star (alias: f) ===
+Keys: fact_id (PK), bus_sk, date_id
+Columns:
+- fault_id
+- failure_flag (BOOLEAN)
+- maintenance_flag (BOOLEAN)
+- trip_distance_km
+- avg_speed_kmh
+- passengers_avg
+- temperature_avg_c
+- engine_hours_total
+- mileage_total_km
 
-2. public.dim_bus_star
-   - One row per bus.
-   - Columns:
-     - bus_sk (PK, bigint)
-     - bus_id (text)
-     - avg_daily_distance (double precision)
-     - avg_daily_speed (double precision)
-     - avg_passengers (double precision)
-     - max_engine_hours (double precision)
-     - max_mileage_total (bigint)  -- total lifetime mileage per bus
-     - total_failures (bigint)
-   - Use this when the user asks about:
-     - “buses with the highest mileage / קילומטראז' הכי גבוה”
-     - “buses with most failures overall”
-     - distribution of bus-level features.
+=== B. dim_bus_star (alias: b) ===
+Key: bus_sk (PK)
+Columns:
+- bus_id (TEXT)
 
-3. public.fact_bus_status_star
-   - One row per bus per date.
-   - Columns:
-     - fact_id (PK)
-     - bus_sk (FK -> dim_bus_star.bus_sk)
-     - date_id (date, FK -> dim_date.date_id)
-     - fault_id (FK -> dim_fault.fault_id, may be NULL)
-     - trip_distance_km (double precision)   -- distance for that day
-     - mileage_total_km (bigint)             -- cumulative mileage up to that day
-     - avg_speed_kmh, passengers_avg, temperature_avg_c, engine_hours_total
-     - maintenance_flag (boolean)
-     - failure_flag (boolean)
-   - Use this for:
-     - daily distance / mileage by date
-     - failures and maintenance over time
-     - aggregations by date range.
+=== C. dim_date (alias: d) ===
+Key: date_id (DATE)
+Columns:
+- year
+- month
+- quarter
+- day
+- day_of_week
+- dow_name
+- season (TEXT)  -- 'Autumn', 'Winter', 'Spring', 'Summer'
 
-4. public.fact_bus_daily
-   - One row per (bus_id, date) in a denormalized raw form.
-   - Columns:
-     - bus_id (text)
-     - date (text)
-     - trip_distance_km, avg_speed_kmh, passengers_avg
-     - engine_hours_total, mileage_total_km
-     - failure_type, maintenance_date, failure_flag, maintenance_flag, season
-   - You may use this instead of fact_bus_status_star when bus_id (not bus_sk) is more convenient.
+=== D. fact_bus_daily (alias: fbd) ===
+(Verified from information_schema.columns)
+Columns:
+- bus_id (TEXT)
+- date (TEXT)                   -- MUST convert using TO_DATE(fbd.date, 'YYYY-MM-DD')
+- region_type (TEXT)            -- Travel mode: 'urban', 'intercity'
+- trip_distance_km
+- avg_speed_kmh
+- passengers_avg
+- temperature_avg_c
+- engine_hours_total
+- mileage_total_km
+- failure_type
+- maintenance_date
+- failure_flag
+- maintenance_flag
+- season
+- region_geo (TEXT)             -- Geography: 'South', 'North'
+- temperature_synthetic
 
-5. public.dim_fault
-   - Fault/failure dimension:
-     - fault_id (PK)
-     - failure_type (text)
-     - fault_category (text)
-     - severity (text)
-     - cost metrics (avg_repair_cost_usd, avg_labor_hours, avg_parts_cost_usd, avg_repair_frequency_per_10k_km)
+=== E. bridge_fault_part (alias: bp) ===
+Columns:
+- fault_id
+- part_id
 
-6. public.dim_part, public.bridge_fault_part
-   - Parts and mapping between faults and parts.
+=== F. dim_part (alias: dp) ===
+Columns:
+- part_id
+- part_name
 
-7. public.dim_date
-   - Date dimension (date_id, year, month, day, season, etc.)
+====================================================================
+SPECIAL RULE FOR PART REPLACEMENT QUERIES
+====================================================================
 
-8. public.vw_preds_costed_final, public.ml_costed_predictions(_physical), public.ml_predictions_daily(_physical)
-   - Additional prediction / cost outputs. Only use columns that exist in the schema:
-     bus_id, date, predicted_proba, predicted_label, failure_type, expected_cost_usd, etc.
+If the user asks any question about:
+- "איזה חלקים הוחלפו"
+- "most replaced parts"
+- "parts replaced"
+- "מה הוחלף"
+- "parts failures"
 
-=== VERY IMPORTANT RULES ===
+You MUST use the following join sequence IN ADDITION to the mandatory joins:
 
-- You MUST NOT invent columns or tables.
-  - Example of valid mileage columns:
-    - dim_bus_star.max_mileage_total       (total lifetime mileage per bus)
-    - fact_bus_status_star.trip_distance_km, fact_bus_status_star.mileage_total_km
-    - fact_bus_daily.trip_distance_km, fact_bus_daily.mileage_total_km
-  - DO NOT use columns like "mileage" or "distance" if they are not exactly present in the schema.
+LEFT JOIN public.bridge_fault_part bp
+  ON f.fault_id = bp.fault_id
 
-- When the user asks:
-  - “Top buses by highest mileage / הקילומטראז' הכי גבוה”:
-    Prefer:
-      SELECT bus_id, max_mileage_total AS total_mileage_km
-      FROM public.dim_bus_star
-      ORDER BY max_mileage_total DESC
-      LIMIT :limit;
+LEFT JOIN public.dim_part dp
+  ON bp.part_id = dp.part_id
 
-  - “Daily distance / mileage over a period”:
-    You may use:
-      public.fact_bus_status_star (join dim_bus_star for bus_id if needed)
-      or public.fact_bus_daily (directly by bus_id).
+And when grouping:
+- ALWAYS group by dp.part_name
+- NEVER group only by fault_id
 
-- When working with predictions:
-  - Always use the unified predictions subselect aliased as p (injected via {schema_summary_for_llm()} and PRED_SRC).
-  - Typical columns: p.bus_id, p.date, p.proba_7d, p.label_7d, p.proba_30d, p.label_30d, p.failure_reason, p.likely_fault.
+====================================================================
+2. MANDATORY JOIN PIPELINE (NEVER MODIFY)
+====================================================================
 
-=== SQL Constraints ===
+Always use EXACTLY this join sequence:
 
-- Output ONLY a JSON object with keys:
-  action, sql, needs_date, needs_range, needs_limit, title.
-- The SQL MUST be a read-only PostgreSQL SELECT (CTE allowed), ending with LIMIT (it will be replaced with :limit).
-- For “today” filters, use: p.date::date = :d or date_id = :d where appropriate.
-- For date ranges, use BETWEEN :start AND :end on date/date_id.
-- Always fully qualify tables with schema when possible (public.table_name).
+FROM public.fact_bus_status_star f
+JOIN public.dim_bus_star b
+  ON f.bus_sk = b.bus_sk
+JOIN public.dim_date d
+  ON f.date_id = d.date_id
+JOIN public.fact_bus_daily fbd
+  ON fbd.bus_id = b.bus_id
+ AND TO_DATE(fbd.date, 'YYYY-MM-DD') = f.date_id
 
-Return JSON ONLY, no markdown fences.
-""".strip()
+NEVER omit the TO_DATE conversion.
+NEVER join different tables unless explicitly required.
+
+====================================================================
+3. CANONICAL VALUE MAPPINGS (STRICT)
+====================================================================
+
+=== A. GEOGRAPHY (from fbd.region_geo) ===
+Valid values:
+- 'South'
+- 'North'
+
+User intent mapping:
+- "דרום" / "south" → fbd.region_geo = 'South'
+- "צפון" / "north" → fbd.region_geo = 'North'
+
+=== B. TRAVEL MODE (from fbd.region_type) ===
+Valid values:
+- 'urban'
+- 'intercity'
+
+User intent:
+- "עירוני" / "urban" → fbd.region_type = 'urban'
+- "בין עירוני" / "intercity" → fbd.region_type = 'intercity'
+
+=== C. SEASONS (from dim_date.season) ===
+Valid values:
+- 'Autumn'
+- 'Winter'
+- 'Spring'
+- 'Summer'
+
+=== D. FAILURE DEFINITION ===
+A failure is:
+COALESCE(f.failure_flag, FALSE) = TRUE OR f.fault_id IS NOT NULL
+
+====================================================================
+4. SQL PLANNING RULES
+====================================================================
+
+1. If user specifies REGION → filter on fbd.region_geo.
+2. If user specifies TRAVEL MODE → filter on fbd.region_type.
+3. If user specifies SEASON → use d.season = '<value>'.
+4. If user specifies YEAR → use d.year = <value>.
+5. COUNT failures ONLY using the FAILURE DEFINITION above.
+6. NEVER infer date ranges unless user explicitly asks.
+7. NEVER guess columns that aren’t in this document.
+
+====================================================================
+5. OUTPUT FORMAT REQUIREMENTS
+====================================================================
+
+You MUST output ONLY valid JSON in the following format:
+
+{
+  "sql": "<RAW SQL STRING>"
+}
+
+NO comments.
+NO explanations.
+NO markdown.
+SQL string only.
+
+====================================================================
+6. SAFETY RULES
+====================================================================
+
+- NEVER invent columns.
+- NEVER use region_type instead of region_geo.
+- NEVER use date directly — always TO_DATE(fbd.date, 'YYYY-MM-DD').
+- NEVER remove any of the mandatory joins.
+- NEVER join predictions tables unless explicitly requested.
+- SQL must be runnable exactly as-is.
+
+"""
+
 
 
 def _safe_json_loads(s: str):
@@ -625,138 +729,66 @@ def _guess_days_from_hebrew(text: str, default: int = 7) -> int:
 # Fallback Agent
 # =========================
 
-def run_fallback_agent(
-    user_text: str,
-    d: date,
-    default_limit: int,
-    days_hint: Optional[int],
-) -> bool:
+def run_fallback_agent(sql: str, params: dict, engine, logger=None):
     """
-    סוכן פולבק:
-    טקסט חופשי -> תכנון שאילתה עם LLM -> בדיקות בטיחות -> הרצת SQL.
-    התוצאה נשמרת ב shared_state.LAST_AGENT_DF / LAST_AGENT_TITLE.
+    Safe fallback agent:
+    - Ensures SELECT only
+    - Removes trailing semicolon
+    - Adds LIMIT safely
+    - Handles missing logger gracefully
+    - Executes SQL safely and returns DataFrame
     """
-    # ננסה קודם להבין טווח טבעי (למשל "ב 17 הימים האחרונים")
-    nat_rng = parse_natural_range(user_text, d)
-
-    log_agent("Calling LLM planner", query=user_text)
-    plan = llm_plan(user_text)
-    if not plan or not plan.get("sql"):
-        log_agent("Planner returned no SQL", plan=str(plan))
-        return False
-
-    sql = plan.get("sql", "")
-
-    # 1. מחיקה של CTE בעייתי מהסוג:
-    #    WITH p AS (SELECT * FROM vw_preds_costed_final) ...
-    sql = re.sub(
-        r"^\s*WITH\s+p\s+AS\s*\(SELECT\s+\*\s+FROM\s+vw_preds_costed_final\s*\)\s*",
-        "",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # 2. נורמליזציה של טבלת התחזיות
-    sql = re.sub(r"\bvw_preds_costed_final\b", PRED_SRC, sql, flags=re.IGNORECASE)
-    sql = sql.replace("FROM public.predictions_for_powerbi p", f"FROM {PRED_SRC}")
-    sql = sql.replace("FROM predictions_for_powerbi p", f"FROM {PRED_SRC}")
-
-    # מקרים שבהם ה LLM שם סתם "FROM p"
-    if " FROM p" in sql or re.search(r"\bfrom\s+p\b", sql, re.IGNORECASE):
-        sql = re.sub(r"\bfrom\s+p\b", f"FROM {PRED_SRC}", sql, flags=re.IGNORECASE)
-
-    # 3. אם צריך טווח, נעגן את CURRENT_DATE לתאריך הסימולציה (:d)
-    if plan.get("needs_range") and "CURRENT_DATE" in sql:
-        sql = sql.replace("CURRENT_DATE", ":d")
-
-    # 4. נורמליזציה של שמות עמודות
-    replacements = {
-        "p.predicted_proba": "p.proba_7d",
-        "predicted_proba": "proba_7d",
-        "p.predicted_label": "p.label_7d",
-        "predicted_label": "label_7d",
-        "p.failure_type_canon": "p.failure_reason",
-        "failure_type_canon": "failure_reason",
-    }
-    for src, dst in replacements.items():
-        sql = sql.replace(src, dst)
-
-    # 5. הזרקת LIMIT פרמטרי
-    sql = _force_limit_param(sql)
-
-    ok, reason = is_sql_safe(sql)
-    if not ok:
-        log_agent("Unsafe SQL from planner", reason=reason, sql=sql)
-        return False
-
-    # ---------------- פרמטרים ----------------
-    params: Dict[str, Any] = {}
-
-    # טווח תאריכים
-    needs_range = bool(plan.get("needs_range", False)) or (":start" in sql and ":end" in sql)
-    if needs_range:
-        if nat_rng:
-            start, end, _ = nat_rng
-        else:
-            # אם אין טווח טבעי מפורש, ננסה:
-            # 1. days_hint שמגיע מה intents
-            # 2. היוריסטיקה למילים "שבועיים" / "שבוע"
-            base_days = days_hint or _guess_days_from_hebrew(user_text, default=7)
-            start, end = _range_last_n(d, base_days, "days")
-
-        params["start"] = start
-        params["end"] = end
-
-    # תאריך סימולציה יחיד
-    if bool(plan.get("needs_date", False)) or (":d" in sql):
-        params["d"] = d
-
-    # LIMIT:
-    #   ברירת מחדל – מה sidebar
-    #   אבל אם זו שאילתת טווח (שבוע/שבועיים/last days) נגדיל ל 500 לפחות.
-    effective_limit = default_limit
-    if needs_range:
-        txt = user_text or ""
-        if (
-            "שבוע" in txt  # כולל "שבועיים" ו"שבוע האחרון"
-            or "שבועיים" in txt
-            or re.search(r"\b(last|past)\b", txt, re.IGNORECASE)
-            or "ימים האחרונים" in txt
-        ):
-            effective_limit = max(default_limit, 500)
-
-    params["limit"] = max(1, min(2000, effective_limit))
-
-    log_agent("Final SQL plan", sql=sql, params=params)
-
-    # ---------------- הרצת השאילתה ----------------
     try:
-        df = q(sql, params)
+        # ---------------------------------------------------
+        # 1. הבטחת לוגר תקין
+        # ---------------------------------------------------
+        if logger is None:
+            class DummyLogger:
+                def info(self, *a, **k): pass
+                def error(self, *a, **k): pass
+            logger = DummyLogger()
+
+        clean_sql = (sql or "").strip()
+        lower_sql = clean_sql.lower()
+
+        # ---------------------------------------------------
+        # 2. מוודא שהשאילתה היא SELECT בלבד
+        # ---------------------------------------------------
+        if not (lower_sql.startswith("select") or lower_sql.startswith("with")):
+            raise ValueError("Fallback agent: only SELECT queries are allowed.")
+
+        # ---------------------------------------------------
+        # 3. מסיר נקודה פסיק בסוף
+        # ---------------------------------------------------
+        if clean_sql.endswith(";"):
+            clean_sql = clean_sql[:-1].strip()
+
+        # ---------------------------------------------------
+        # 4. מוסיף LIMIT :limit אם אין
+        # ---------------------------------------------------
+        if "limit" not in lower_sql:
+            clean_sql += "\nLIMIT :limit"
+
+        logger.info("[FALLBACK] Executing SQL:\n%s", clean_sql)
+        logger.info("[FALLBACK] Params: %s", params)
+
+        # ---------------------------------------------------
+        # 5. הרצת SQL בצורה בטוחה
+        # ---------------------------------------------------
+        from sqlalchemy import text
+        import pandas as pd
+
+        with engine.connect() as conn:
+            result = conn.execute(text(clean_sql), params)
+            rows = result.fetchall()
+            cols = result.keys()
+
+        df = pd.DataFrame(rows, columns=cols)
+
+        logger.info("[FALLBACK] Query OK. rows=%d", len(df))
+        return df
+
     except Exception as e:
-        log_agent("SQL error in fallback agent", error=str(e))
-        # נחזיר True כדי שהשכבה העליונה תוכל להסביר שהבקשה נכשלה
-        return True
+        logger.error("[FALLBACK ERROR] %s", e, exc_info=True)
+        raise
 
-    # ---------------- פוסט פרוססינג ----------------
-    if "failure_reason" in df.columns:
-        df["reason_he"] = df["failure_reason"].apply(humanize_reason_he)
-    if "likely_fault" in df.columns:
-        df["where_he"] = df["likely_fault"].apply(where_from_likely_fault)
-
-    prob_col = None
-    if "proba_7d" in df.columns:
-        prob_col = "proba_7d"
-    elif "predicted_proba" in df.columns:
-        prob_col = "predicted_proba"
-
-    if prob_col:
-        df = add_row_explanation(df, prob_col=prob_col)
-
-    from .utils_logging import logger
-    logger.info("Fallback agent returned %d rows", len(df))
-
-    from . import shared_state
-    shared_state.LAST_AGENT_DF = df
-    shared_state.LAST_AGENT_TITLE = plan.get("title") or "תוצאה (Agent)"
-
-    return True

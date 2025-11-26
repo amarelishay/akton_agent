@@ -1,94 +1,122 @@
-
 from __future__ import annotations
+from difflib import SequenceMatcher
+from typing import Any, Dict, Tuple
 import re
-from typing import Any, Dict
-from datetime import date
 
-from .time_range import parse_natural_range
+# --- רשימת שאלות הזהב (Golden Examples) ---
+# המפתחות תואמים ללוגיקה ב-app_streamlit.py
+# ככל שיש יותר דוגמאות מגוונות, הזיהוי יהיה מדויק יותר (Fuzzy Matching).
 
-HE_NUMS = {
-    "אחת": 1, "אחד": 1, "שניים": 2, "שתיים": 2,
-    "שלושה": 3, "שלוש": 3, "ארבעה": 4, "ארבע": 4,
-    "חמישה": 5, "חמשת": 5, "חמש": 5,
-    "שישה": 6, "שש": 6, "שבעה": 7, "שבע": 7,
-    "שמונה": 8, "תשעה": 9, "תשע": 9, "עשרה": 10, "עשר": 10,
+GOLDEN_EXAMPLES = {
+    "WHO_AT_RISK_TODAY": [
+        # עברית
+        "מי בסיכון היום",
+        "אילו אוטובוסים בסיכון",
+        "מי בסיכון",
+        "מי הכי מסוכן היום",
+        "תראה לי אוטובוסים בסיכון גבוה",
+        "רשימת סיכונים להיום",
+        "מי עומד להתקלקל",
+        "איזה אוטובוסים בבעיה",
+        "דוח סיכונים יומי",
+        "סיכון יומי",
+
+        # אנגלית
+        "Who is at risk today",
+        "Which buses are at risk",
+        "High risk buses",
+        "Today's risk report",
+        "Show me risky buses",
+        "Predictive failures today"
+    ],
+
+    "PERIOD_SUMMARY": [
+        # עברית - וריאציות של סיכום
+        "מה קרה בשבוע האחרון",
+        "סיכום שבועיים אחרונים",
+        "מה קרה לאחרונה",
+        "תמונת מצב שבועית",
+        "סיכום תקופה",
+        "דוח מסכם",
+        "מה היה בשבוע שעבר",
+        "מה קרה בשבועיים האחרונים",
+        "מה קרה בשבוע האחרון",
+        "סכם לי את השבוע האחרון",
+        "סכם לי את החודש האחרון"
+        "איך היו הביצועים לאחרונה",
+        "סיכום אירועים אחרונים",
+        "סטטוס שבועי",
+
+        # אנגלית
+        "summary of last week",
+        "what happened recently",
+        "last 2 weeks summary",
+        "period overview",
+        "recent events",
+        "weekly report"
+    ],
+
+    # זיהוי אוטובוס ספציפי נעשה בעיקר ע"י Regex, אבל הדוגמאות עוזרות לדיוק
+    "BUS_STATUS": [
+        "מה המצב של אוטובוס",
+        "תבדוק את אוטובוס",
+        "סטטוס BUS",
+        "פרטים על אוטובוס",
+        "Check bus status",
+        "Bus details"
+    ]
 }
-INTENTS = {
-    "WHO_AT_RISK_TODAY": re.compile(
-        r"(מי|איזה)\s+(אוטובוס|אוטובוסים)?.*בסיכון(\s*היום)?\??",
-        re.IGNORECASE,
-    ),
-    "BUS_STATUS": re.compile(
-        r"(?:\bBUS[_\-\s]*|\bאוטובוס\s*)(\d{1,3})\b",
-        re.IGNORECASE,
-    ),
-    "MOST_REPLACED_PARTS": re.compile(
-        r"(איזה|מהם)\s+חלק(ים)?\s+(שהוחלפו|הוחלפו)\s+הכי\s+הרבה",
-        re.IGNORECASE,
-    ),
-    "WHAT_HAPPENED_LAST_DAYS": re.compile(
-        r"(מה\sקרה\sבשבועיים|מה\sקרה\sב\d+\s*יום)",
-        re.IGNORECASE,
-    ),
-    # כל התקלות שהיו לאוטובוס מסוים
-    "BUS_ALL_FAILURES": re.compile(
-        r"(כל\s+התקלות|סיכום\s+כל\s+התקלות).*?(bus|אוטובוס)",
-        re.IGNORECASE,
-    ),
-    "BUS_MOST_FAILURES": re.compile(
-        r"(הכי הרבה תקלות|הכי הרבה\s+תקלות)",
-        re.IGNORECASE,
-    ),
-    "HIGHEST_RISK_N": re.compile(
-        r"(?:חמש(?:ת)?|ארבע(?:ה)?|שלוש(?:ה)?|שתיים|שניים|עשר(?:ה)?|\d+)\s+האוטובוסים?\s+.*בסיכון\s+(?:הכי|הגבוה(?:ה)?(?:\sביותר)?)\s*(?:היום)?",
-        re.IGNORECASE,
-    ),
-    "TOP_LIST": re.compile(
-        r"(top|טופ)\s*(\d+)?",
-        re.IGNORECASE,
-    ),
-    "ANY_NATURAL_RANGE": re.compile(
-        r"(מה\sקרה\b.*)|\b(last|past)\b|\bמאז\b|\bמ[- ]\d|\bעד\b|\bשבוע האחרון\b|\bחודש האחרון\b|\bשנה האחרונה\b",
-        re.IGNORECASE,
-    ),
-}
 
 
-
-def normalize_bus_id(text: str) -> str | None:
-    m = re.search(r"\bbus[_\-\s]*(\d{1,3})\b", text, re.IGNORECASE) or re.search(
-        r"\b(?:ל|אל)?אוטובוס\s*(\d{1,3})\b", text, re.IGNORECASE
-    )
-    return f"BUS_{int(m.group(1)):03d}" if m else None
+def _get_similarity(a: str, b: str) -> float:
+    """מחשב דמיון בין מחרוזות (0.0 עד 1.0)"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 
-
-def extract_top_n(text: str, default_n: int) -> int:
-    m = re.search(r"\b(\d+)\b", text)
-    if m:
-        return max(1, int(m.group(1)))
-    for w, n in HE_NUMS.items():
-        if re.search(rf"\b{w}\b", text):
-            return n
-    return default_n
-
-
-def detect_intents(text: str, today: date, default_top_limit: int) -> Dict[str, Any]:
+def detect_intents(text: str, today: Any, default_top_limit: int) -> Dict[str, Any]:
+    """
+    מזהה כוונות אך ורק אם הן דומות מאוד לדוגמאות הזהב.
+    כל השאר יחזיר False וילך ל-LLM.
+    """
     t = text.strip()
-    out: Dict[str, Any] = {}
-    for name, rx in INTENTS.items():
-        m = rx.search(t)
-        out[name] = (m.groups() if (m and m.groups()) else True) if m else False
+    out: Dict[str, Any] = {
+        "WHO_AT_RISK_TODAY": False,
+        "PERIOD_SUMMARY": False,
+        "BUS_ID": None,
+        "TOP_N": default_top_limit,
+        "DAYS": 14  # ברירת מחדל לסיכום
+    }
 
-    if not out.get("TOP_LIST") and not out.get("HIGHEST_RISK_N"):
-        if re.search(r"בסיכון\s+(?:הכי|הגבוה(?:ה)?(?:\sביותר)?)", t):
-            out["TOP_LIST"] = True
+    # 1. זיהוי אוטובוס ספציפי (Regex עדיף למספרים)
+    # תופס: "BUS 123", "אוטובוס 55", "bus_001"
+    m_bus = re.search(r"(?:BUS|אוטובוס)[_\-\s]*(\d{1,3})", t, re.IGNORECASE)
+    if m_bus:
+        out["BUS_ID"] = f"BUS_{int(m_bus.group(1)):03d}"
+        return out  # נחזיר מיד כדי לא לבלבל עם כוונות אחרות
 
-    out["RESOLVED_RANGE"] = parse_natural_range(t, today)
-    out["DAYS"] = None
-    m = re.search(r"(top|טופ)\s*(\d+)", t, re.IGNORECASE)
-    if m:
-        out["TOP_N"] = int(m.group(2))
-    out["TOP_N_TEXT"] = extract_top_n(t, default_top_limit)
-    out["BUS_ID"] = normalize_bus_id(t)
+    # 2. בדיקת דמיון לשאר השאלות הקבועות (Fuzzy Matching)
+    # סף הדמיון: 0.65 (קצת יותר גמיש כדי לתפוס וריאציות קלות)
+    threshold = 0.65
+
+    best_score = 0.0
+    best_intent = None
+
+    for intent, examples in GOLDEN_EXAMPLES.items():
+        if intent == "BUS_STATUS": continue  # טופל כבר למעלה
+
+        for ex in examples:
+            score = _get_similarity(t, ex)
+            if score > best_score:
+                best_score = score
+                best_intent = intent
+
+    if best_score >= threshold:
+        out[best_intent] = True
+
+    # 3. זיהוי פרמטרים משלימים (למקרה שנפלנו על PERIOD_SUMMARY)
+    # מנסה לחלץ ימים אם המשתמש כתב "סיכום 30 ימים"
+    m_days = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
+    if m_days:
+        out["DAYS"] = int(m_days.group(1))
+
     return out
