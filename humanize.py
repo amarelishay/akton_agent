@@ -7,59 +7,72 @@ from .config import OPENAI_MODEL, LLM_TEMPERATURE, resolve_openai_key
 OPENAI_API_KEY = resolve_openai_key()
 
 LIKELY_FAULT_MAP_HE = {
-    "Cooling/Engine": "במערכת הקירור או המנוע (רדיאטור, משאבת מים, צנרת, תרמוסטט)",
-    "Transmission/Suspension": "במערכת התמסורת או המתלים (גיר, קלאץ', בולמים)",
-    "Engine": "במנוע (הצתה/דלק/חיישנים)",
+    "Cooling/Engine": "במערכת הקירור או המנוע",
+    "Transmission/Suspension": "במערכת התמסורת או המתלים",
+    "Engine": "במנוע",
     "Brakes": "במערכת הבלמים",
-    "Electrical": "במערכת החשמל/חיווט",
-    "Unknown": "נדרש בירור — אין דפוס ברור",
+    "Electrical": "במערכת החשמל",
+    "Unknown": "תקלה כללית",
 }
 
 
 def humanize_reason_he(reason: Optional[str]) -> str:
     """
-    ממיר רשימת גורמים טכניים (כמו speed_std_7d↑) להסבר אנושי בעברית.
+    ממיר רשימת גורמים טכניים להסבר אנושי וקריא בעברית.
     """
     r = (reason or "").strip()
-    if not r or r.lower() == "none":
-        return "אין גורם בולט ספציפי"
+    if not r or r.lower() == "none" or r == "nan":
+        return "ללא גורמים חריגים"
 
-    # מיפוי משופר - תומך גם ב (+) וגם ב (↑)
+    # סדר המיפוי חשוב (ביטויים ספציפיים קודם)
     mapping = [
-        (r"speed_std_7d[\+↑]?", "תנודתיות גבוהה במהירות בשבוע האחרון"),
-        (r"speed_delta[\+↑]?", "שינויי מהירות חדים"),
-        (r"temp_delta[\+↑]?", "קפיצות חום חריגות"),
-        (r"part_km_since_event[\+↑]?", "מרחק גדול מאז טיפול/החלפה אחרונים"),
+        # === מונחים חדשים שנוספו ===
+        (r"part_wear_pct[\+↑]?", "אחוז שחיקת חלקים גבוה"),
+        (r"part_wear[\+↑]?", "שחיקת חלקים"),
+
+        # === טמפרטורה ===
+        (r"temp_std_7d[\+↑]?", "חוסר יציבות בטמפרטורת מנוע"),
+        (r"temp_delta[\+↑]?", "קפיצות טמפרטורה חדות"),
+        (r"temp_mean[\+↑]?", "התחממות ממוצעת"),
+
+        # === מהירות ===
+        (r"speed_std_7d[\+↑]?", "נהיגה לא יציבה"),
+        (r"speed_delta[\+↑]?", "שינויי מהירות חריגים"),
+
+        # === שימוש ובלאי ===
+        (r"part_km_since_event[\+↑]?", "זמן רב מאז טיפול אחרון"),
         (r"mileage_growth[\+↑]?", "עלייה חריגה בקילומטראז'"),
-        (r"engine_growth[\+↑]?", "עלייה מצטברת בשעות מנוע"),
-        (r"no standout factors", "אין גורם בולט ספציפי"),
+        (r"engine_growth[\+↑]?", "צבירת שעות מנוע"),
+
+        # === ניקוי כללי ===
+        (r"no standout factors", "ללא גורמים בולטים"),
     ]
 
     for pat, rep in mapping:
-        # שימוש ב-IGNORECASE כדי לתפוס אותיות גדולות/קטנות
         r = re.sub(pat, rep, r, flags=re.IGNORECASE)
 
-    # ניקוי רעשים טכניים כמו (0.5σ) או (0.4)
+    # ניקוי רעשים טכניים: (0.5σ), ↑, +
     r = re.sub(r"\(\d+(\.\d+)?[σ]?\)", "", r)
+    r = re.sub(r"[\↑\+]", "", r)
 
-    # ניקוי רווחים כפולים ופסיקים מיותרים
-    r = re.sub(r"\s{2,}", " ", r).replace(" ,", ", ").strip().strip(",")
+    # סידור פסיקים ורווחים
+    r = re.sub(r"\s{2,}", " ", r)
+    r = r.replace(" ,", ",").replace(",,", ",").strip().strip(",")
 
-    return r or "אין גורם בולט ספציפי"
+    return r
 
 
 def where_from_likely_fault(likely_fault: Optional[str]) -> str:
     val = (likely_fault or "").strip()
-    # טיפול במקרה שהמודל מחזיר רשימה או מחרוזת מלוכלכת
     for k, v in LIKELY_FAULT_MAP_HE.items():
         if k.lower() in val.lower():
             return v
-    return LIKELY_FAULT_MAP_HE["Unknown"]
+    return "במערכת לא מזוהה"
 
 
 def paraphrase_he(text: str) -> str:
     """
-    משתמש ב-LLM כדי לשכתב טקסטים גנריים לעברית טבעית יותר.
+    משתמש ב-LLM כדי ללטש ניסוחים אם יש מפתח API.
     """
     if not OPENAI_API_KEY:
         return text
@@ -70,7 +83,8 @@ def paraphrase_he(text: str) -> str:
             model=OPENAI_MODEL,
             temperature=LLM_TEMPERATURE,
             messages=[
-                {"role": "user", "content": "שכתב לעברית טבעית וברורה. שמור על המשמעות המקורית.\n---\n" + text}
+                {"role": "system", "content": "אתה מנהל צי רכב. שכתב את המשפט לעברית מקצועית וקצרה."},
+                {"role": "user", "content": text}
             ],
         )
         return (resp.choices[0].message.content or "").strip()
@@ -80,53 +94,50 @@ def paraphrase_he(text: str) -> str:
 
 def pretty_bus_id(bus_id: str | None) -> str:
     """
-    מציג BUS_032 כ-'BUS 32'.
+    מתקן תצוגת שם אוטובוס (במקום קו -> אוטובוס).
     """
     s = str(bus_id or "").strip()
+    # מזהה BUS_028 או BUS 28
     m = re.match(r"^BUS[_\-\s]*0*(\d+)$", s, re.IGNORECASE)
     if m:
-        return f"BUS {int(m.group(1))}"
+        return f"אוטובוס {int(m.group(1))}"  # התיקון שביקשת
     return s
 
 
 def add_row_explanation(df: pd.DataFrame, prob_col: str) -> pd.DataFrame:
-    """
-    מוסיף עמודת הסבר מילולי מלא (explanation_he) לכל שורה בטבלה.
-    """
     if df.empty:
         return df
 
     df = df.copy()
 
-    # 1. מילוי עמודות עזר בעברית אם הן חסרות
+    # מילוי עמודות עזר
     if "reason_he" not in df.columns and "failure_reason" in df.columns:
         df["reason_he"] = df["failure_reason"].apply(humanize_reason_he)
 
     if "where_he" not in df.columns and "likely_fault" in df.columns:
         df["where_he"] = df["likely_fault"].apply(where_from_likely_fault)
 
-    # שימוש ב-LLM רק אם הטבלה קטנה (לחסכון בזמן ועלויות)
-    use_llm = bool(OPENAI_API_KEY) and len(df) <= 15
+    # שימוש ב-LLM רק לטבלאות קטנות (עד 5 שורות) כדי לא להאט
+    use_llm = bool(OPENAI_API_KEY) and len(df) <= 5
 
     def _build_explanation(row):
-        # שליפת נתונים
         p = row.get(prob_col)
-        p_txt = f"{p:.0%}" if isinstance(p, (int, float)) else "N/A"
+        p_txt = f"{p:.0%}" if isinstance(p, (int, float)) else "?%"
 
         bus_name = pretty_bus_id(row.get("bus_id"))
-        date_str = row.get("d", row.get("date", ""))
+        date_raw = row.get("d", row.get("date", ""))
+        date_str = str(date_raw)[:10]  # חיתוך שעה אם יש
 
-        reasons = row.get("reason_he", "סיבות טכניות")
-        system = row.get("where_he", "מערכת לא ידועה")
+        reasons = row.get("reason_he", "")
+        system = row.get("where_he", "")
 
-        # בניית המשפט
+        # הפורמט המתוקן
         base_text = (
-            f"לאוטובוס {bus_name} יש הסתברות של {p_txt} לתקלה ב-{date_str}. "
-            f"הסימנים המקדימים הם {reasons}, "
-            f"והחשד הוא לתקלה {system}."
+            f"ל-{bus_name} יש הסתברות של {p_txt} לתקלה ב-{date_str}. "
+            f"החשד הוא לתקלה {system}. "
+            f"גורמים חריגים שזוהו: {reasons}."
         )
 
-        # אם הרשימה קצרה, נבקש מה-LLM לנסח יפה יותר
         if use_llm:
             return paraphrase_he(base_text)
 
