@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 import datetime as dt
 from datetime import date, timedelta
@@ -8,11 +9,9 @@ import re as _re2
 
 import pandas as pd
 import streamlit as st
-from sqlalchemy import text  # <--- תוספת קריטית להרצת שאילתות ישירות
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 
-# --- ייבוא המודולים הפנימיים ---
-from .db import engine, q  # <--- הייבוא המתוקן של המנוע
+# --- ייבוא מודולים ---
 from .config import resolve_openai_key
 from .humanize import paraphrase_he, pretty_bus_id
 from .intents import detect_intents
@@ -76,118 +75,127 @@ class fancy_spinner:
         self.placeholder.empty()
 
 
-def _is_risk_query(text: str) -> bool:
-    t = (text or "").lower()
-    return any(w in t for w in ["סיכון", "risk", "probability", "chance", "סיכוי"])
+def _extract_time_period(text: str) -> int:
+    """
+    מחלץ טווח זמן גמיש (מספר כלשהו + יחידת זמן) מתוך הטקסט.
+    תומך ב: ימים, שבועות, חודשים, שנים.
+    """
+    t = text.lower()
 
+    # 1. זיהוי מספרים כללי (חילוץ כל המספרים במשפט)
+    # מחפש רצף של ספרות שנמצא ליד מילת מפתח
+
+    # שנה/ים
+    m_year = re.search(r"(\d+)\s*(?:שנה|שנים|year|years)", t)
+    if m_year:
+        return int(m_year.group(1)) * 365
+
+    # חודש/ים
+    m_month = re.search(r"(\d+)\s*(?:חודש|חודשים|month|months)", t)
+    if m_month:
+        return int(m_month.group(1)) * 30
+
+    # שבוע/ות
+    m_week = re.search(r"(\d+)\s*(?:שבוע|שבועות|week|weeks)", t)
+    if m_week:
+        return int(m_week.group(1)) * 7
+
+    # יום/ימים (הכי נפוץ - תופס "251 יום", "5 ימים")
+    m_day = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
+    if m_day:
+        return int(m_day.group(1))
+
+    # זיהוי ללא מספר (מקרים בודדים)
+    if "שנה" in t or "year" in t: return 365
+    if "חודש" in t or "month" in t: return 30
+    if "שבוע" in t or "week" in t: return 7
+    if "יום" in t or "day" in t: return 1
+
+    return 14  # ברירת מחדל אם לא זוהה כלום
 
 def _extract_days_from_query(text: str, default: int = 30) -> int:
-    m = _re2.search(r"(\d+)\s*(יום|ימים|day|days)", (text or ""))
-    return int(m.group(1)) if m else default
+    return _extract_time_period(text)
 
 
 def _has_hebrew(text: str) -> bool:
     return bool(_re2.search(r"[\u0590-\u05FF]", text or ""))
 
 
-def _is_total_failures_query(text: str) -> bool:
-    patterns = [r"כמה\s+תקלות", r"סה\"?כ\s+תקלות", r"total\s+failures"]
-    return any(_re2.search(p, text.lower()) for p in patterns)
-
-
 # -------------------------------------------------
-# ✨ Table Prettifier (המשפך לטבלאות) ✨
+# ✨ Table Prettifier (עיצוב טבלאות)
 # -------------------------------------------------
 
 def _prettify_table(df: pd.DataFrame, query_text: str = "") -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
 
-    out = df.copy()
+    # 1. מחיקת עמודות כפולות (Safety Net)
+    out = df.loc[:, ~df.columns.duplicated()].copy()
+
     is_he = _has_hebrew(query_text)
 
-    # נרמול שמות עמודות טכניים לשמות אחידים
     rename_map_tech = {
-        "d": "date",
-        "predicted_proba": "prob",
-        "proba_7d": "prob",
-        "likely_fault": "system",
-        "failure_reason": "reason",
-        "bus_id": "bus"
+        "d": "date", "predicted_proba": "prob", "proba_7d": "prob",
+        "likely_fault": "system", "failure_reason": "reason", "bus_id": "bus",
+        "replacement_count": "replaced_count"
     }
-    out.rename(columns=rename_map_tech, inplace=True)
+    # שינוי שמות רק למה שקיים
+    existing_renames = {k: v for k, v in rename_map_tech.items() if k in out.columns}
+    out.rename(columns=existing_renames, inplace=True)
 
-    # המרת הסתברות לאחוזים
     if "prob" in out.columns:
         out["prob"] = out["prob"].apply(lambda x: f"{x:.0%}" if isinstance(x, (float, int)) else x)
 
-    # הגדרת כותרות לפי שפה
     if is_he:
         final_cols_map = {
-            "bus": "אוטובוס",
-            "date": "תאריך",
-            "prob": "הסתברות לתקלה (%)",
-            "where_he": "מערכת חשודה",
-            "system": "מערכת חשודה (Tech)",
-            "explanation_he": "פירוט הסיכון",
-            "reason_he": "גורמים",
-            "had_failure": "הייתה תקלה?",
-            "part_name": "שם החלק",
-            "replaced_count": "כמות החלפות"
+            "bus": "אוטובוס", "date": "תאריך", "prob": "הסתברות לתקלה (%)",
+            "where_he": "מערכת חשודה", "system": "מערכת (Tech)",
+            "explanation_he": "פירוט הסיכון", "reason_he": "גורמים",
+            "had_failure": "תקלה בפועל", "failure_count": "מספר תקלות",
+            "part_name": "שם החלק", "replaced_count": "כמות החלפות"
         }
-        priority_order = ["bus", "date", "prob", "where_he", "explanation_he", "part_name", "replaced_count"]
+        priority = ["bus", "date", "prob", "where_he", "explanation_he", "failure_count", "part_name", "replaced_count"]
     else:
         final_cols_map = {
-            "bus": "Bus ID",
-            "date": "Date",
-            "prob": "Failure Probability (%)",
-            "system": "Suspected System",
-            "reason": "Risk Factors",
-            "explanation_he": "Details (Hebrew)",
-            "had_failure": "Failed?",
-            "part_name": "Part Name",
-            "replaced_count": "Replacement Count"
+            "bus": "Bus ID", "date": "Date", "prob": "Probability (%)",
+            "system": "System", "reason": "Factors", "explanation_he": "Details",
+            "failure_count": "Failures", "part_name": "Part", "replaced_count": "Count"
         }
-        priority_order = ["bus", "date", "prob", "system", "reason", "part_name", "replaced_count"]
+        priority = ["bus", "date", "prob", "system", "reason", "failure_count", "part_name", "replaced_count"]
 
-    # סינון וסידור העמודות
-    existing_cols = [c for c in priority_order if c in out.columns]
-    other_cols = [c for c in out.columns if c not in existing_cols and c in final_cols_map]
-    final_selection = existing_cols + other_cols
+    existing = [c for c in priority if c in out.columns]
+    others = [c for c in out.columns if c not in existing and c in final_cols_map]
 
-    if not final_selection:
+    final_sel = existing + others
+    if final_sel:
+        out = out[final_sel]
         out.rename(columns=final_cols_map, inplace=True)
-        return out
-
-    out = out[final_selection]
-    out.rename(columns=final_cols_map, inplace=True)
+    else:
+        out.rename(columns=final_cols_map, inplace=True)
 
     return out
 
 
 # -------------------------------------------------
-# HTML Formatting for KPIs
+# HTML KPIs
 # -------------------------------------------------
 
 def _generate_kpi_html(title: str, metrics: list[tuple[str, str, str]]) -> str:
-    cards_html = ""
-    card_style = "background-color:#fff; border:1px solid #ddd; border-radius:8px; padding:10px; flex:1; min-width:110px; text-align:center; margin:4px; box-shadow:0 1px 2px rgba(0,0,0,0.05);"
-
-    for label, value, icon in metrics:
-        cards_html += f"<div style='{card_style}'><div style='font-size:22px; margin-bottom:4px;'>{icon}</div><div style='font-size:12px; color:#666;'>{label}</div><div style='font-size:20px; font-weight:bold; color:#333;'>{value}</div></div>"
-
-    return f"<div style='direction:rtl; margin-bottom:15px;'><div style='font-weight:bold; margin-bottom:8px; color:#444;'>📊 {title}</div><div style='display:flex; flex-wrap:wrap; gap:8px;'>{cards_html}</div></div>"
+    cards = ""
+    style = "background:#fff;border:1px solid #e0e0e0;border-radius:8px;padding:12px;flex:1;min-width:100px;text-align:center;box-shadow:0 1px 2px rgba(0,0,0,0.05);margin:4px;"
+    for lbl, val, ico in metrics:
+        cards += f"<div style='{style}'><div style='font-size:20px;margin-bottom:4px;'>{ico}</div><div style='font-size:12px;color:#666;'>{lbl}</div><div style='font-size:18px;font-weight:bold;color:#2c3e50;'>{val}</div></div>"
+    return f"<div style='direction:rtl;margin-bottom:10px;'><div style='font-weight:bold;margin-bottom:8px;color:#333;'>📊 {title}</div><div style='display:flex;flex-wrap:wrap;gap:8px;'>{cards}</div></div>"
 
 
 # -------------------------------------------------
-# ניהול תאריכים ועונות 🧠
+# ניהול תאריכים ועונות
 # -------------------------------------------------
 
 def _extract_season_name(text: str) -> str | None:
     t = text.lower()
     if "חורף" in t or "winter" in t: return "Winter"
     if "קיץ" in t or "summer" in t: return "Summer"
-    if "סתיו" in t or "fall" in t or "autumn" in t: return "Autumn"
+    if "סתיו" in t or "fall" in t or "autumn" in t: return "Autumn"  # מותאם ל-DB
     if "אביב" in t or "spring" in t: return "Spring"
     return None
 
@@ -213,17 +221,16 @@ def resolve_period_dates(query: str, today: date, intents: dict) -> Tuple[date, 
     if rng:
         return rng[0], rng[1], rng[2], None
 
-    query_lower = query.lower()
-    if "יומי" in query_lower or "היום" in query_lower or "daily" in query_lower or "today" in query_lower:
-        days = 1
-    else:
-        days = intents.get("DAYS")
-        if not days:
-            days = _extract_days_from_query(query, default=14)
+    # חישוב מתמטי לפי טווח הזמן המבוקש
+    days = _extract_time_period(query)
 
     end = today
-    start = today - timedelta(days=days - 1)
-    title = f"סיכום יומי ({today})" if days == 1 else f"{days} הימים האחרונים"
+    start = today - timedelta(days=days)
+
+    title = f"סיכום {days} ימים אחרונים"
+    if days == 1: title = f"סיכום יומי ({today})"
+    if days == 30: title = "סיכום חודש אחרון"
+    if days == 365: title = "סיכום שנה אחרונה"
 
     return start, end, title, None
 
@@ -234,6 +241,7 @@ def resolve_period_dates(query: str, today: date, intents: dict) -> Tuple[date, 
 
 def render_period_dashboard(start: date, end: date, title: str, query_text: str, season_val: str = None) -> None:
     with fancy_spinner(f"מנתח נתונים עבור: {title}..."):
+        # כאן התיקון החשוב: העברת season_val לפונקציות ה-SQL
         trend = df_trend_last_days(start, end, season=season_val)
         risk = df_risk_summary_by_day_bus(start, end, season=season_val)
         detail = df_failures_by_day_detail(start, end, season=season_val)
@@ -243,55 +251,131 @@ def render_period_dashboard(start: date, end: date, title: str, query_text: str,
         return
 
     n_buses = risk["bus_id"].nunique() if not risk.empty else 0
-    n_high_risk = risk.loc[risk["proba_7d"] >= 0.5, "bus_id"].nunique() if not risk.empty else 0
-    n_failures = len(detail) if not detail.empty else 0
-    n_preds = len(risk) if not risk.empty else 0
+    n_high = risk.loc[risk["proba_7d"] >= 0.5, "bus_id"].nunique() if not risk.empty else 0
+    n_fail = len(detail) if not detail.empty else 0
+    n_rec = len(risk) if not risk.empty else 0
 
-    metrics_data = [
-        ("אוטובוסים פעילים", str(n_buses), "🚌"),
-        ("בסיכון גבוה", str(n_high_risk), "⚠️"),
-        ("תקלות בפועל", str(n_failures), "🛠️"),
-        ("רשומות תחזית", str(n_preds), "📉"),
-    ]
-    kpi_html = _generate_kpi_html(title, metrics_data)
+    kpi_html = _generate_kpi_html(title, [
+        ("אוטובוסים", str(n_buses), "🚌"),
+        ("בסיכון גבוה", str(n_high), "⚠️"),
+        ("תקלות", str(n_fail), "🛠️"),
+        ("רשומות", str(n_rec), "📉")
+    ])
 
     trend_txt = ""
     if not trend.empty:
-        first, last = trend.iloc[0]["pct_risk"], trend.iloc[-1]["pct_risk"]
-        direction = "עלייה" if (last - first) >= 0 else "ירידה"
-        trend_txt = paraphrase_he(f"במהלך התקופה נראית {direction} בסיכון הממוצע (מ-{first:.1f}% ל-{last:.1f}%).")
+        f_val, l_val = trend.iloc[0]["pct_risk"], trend.iloc[-1]["pct_risk"]
+        direction = "עלייה" if (l_val - f_val) >= 0 else "ירידה"
+        trend_txt = paraphrase_he(f"זוהתה {direction} ברמת הסיכון מ-{f_val:.1f}% ל-{l_val:.1f}%.")
 
     say(f"{kpi_html}\n\n{trend_txt}")
 
-    if not trend.empty:
-        add_table(f"מגמות סיכון ({title})", trend, query_text)
-
-    if not risk.empty:
-        add_table(f"פירוט סיכונים ותחזיות ({title})", risk.sort_values("proba_7d", ascending=False).head(100),
-                  query_text)
-
-    if not detail.empty:
-        render_failures_matrix(detail, title="פירוט תקלות בפועל")
+    if not trend.empty: add_table(f"מגמות סיכון ({title})", trend, query_text)
+    if not risk.empty: add_table(f"פירוט סיכונים ({title})", risk.sort_values("proba_7d", ascending=False).head(100),
+                                 query_text)
+    if not detail.empty: render_failures_matrix(detail, "פירוט תקלות")
 
 
 # -------------------------------------------------
-# ניהול Session
+# Routing Logic (The Brain) 🧠
 # -------------------------------------------------
+
+def _is_specific_question(query: str) -> bool:
+    t = query.lower()
+    # מילות מפתח לשאלות ספציפיות
+    triggers = ["מי", "איזה", "אילו", "כמה", "למה", "תן לי", "רשימת", "who", "which", "how many", "why", "list", "top",
+                "most", "worst"]
+    # מילות מפתח לסיכום
+    summary_triggers = ["סיכום", "מה קרה", "תמונת מצב", "summary", "status", "overview", "what happened"]
+
+    is_specific = any(w in t for w in triggers)
+    is_summary = any(w in t for w in summary_triggers)
+
+    # אם זה ספציפי וגם לא סיכום -> זה ספציפי
+    return is_specific and not is_summary
+
+
+def answer(query: str) -> None:
+    log_agent("User Query", query=query)
+    today = st.session_state.date
+    intents = detect_intents(query, today, st.session_state.top_limit)
+    log_agent("Detected Intents", **intents)
+
+    # --- עדיפות 1: ישויות ספציפיות (כדי שלא ייבלעו ע"י סיכום כללי) ---
+
+    # 1. כרטיס אוטובוס (אלא אם זו שאלת היסטוריה מורכבת שתלך ל-LLM)
+    if intents.get("BUS_ID"):
+        # אם המשתמש ביקש היסטוריה/תקלות ספציפיות, נדלג ישר ל-LLM
+        if "היסטוריה" in query or "history" in query or "תקלות" in query:
+            pass  # Go to Fallback LLM (למטה)
+        else:
+            # אחרת, נציג כרטיס ביקור מהיר
+            bus_id = intents["BUS_ID"]
+            with fancy_spinner(f"שולף כרטיס ל-{bus_id}..."):
+                df = df_bus_today(today, bus_id)
+                if not df.empty:
+                    say(paraphrase_he(f"סטטוס עדכני: {df.iloc[0]['explanation_he']}"))
+                    add_table(f"סטטוס {bus_id}", df, query)
+                else:
+                    say(f"אין נתונים להיום עבור {bus_id}")
+            return
+
+    # 2. דף הבית (מי בסיכון)
+    if intents.get("WHO_AT_RISK_TODAY"):
+        with fancy_spinner("טוען דוח סיכונים יומי..."):
+            df = df_at_risk_today(today, intents.get("TOP_N", 10))
+            say(f"נמצאו {len(df)} אוטובוסים בסיכון גבוה היום ({today}).")
+            add_table(f"סיכונים - {today}", df, query)
+        return
+
+    # --- עדיפות 2: שאלות חכמות ספציפיות (עוקף דשבורד) ---
+    # אם שואלים "כמה תקלות היו...", זה לא סיכום כללי אלא שאילתה מדויקת
+    if _is_specific_question(query):
+        pass  # Go to Fallback LLM directly
+
+    # --- עדיפות 3: דשבורד תקופתי (עונות, טווחים, מה קרה, סיכום) ---
+    # רק אם לא זיהינו משהו ספציפי יותר, נניח שהמשתמש רוצה סיכום כללי
+    elif (
+            _extract_season_name(query) is not None or
+            _extract_year(query) is not None or
+            intents.get("ANY_NATURAL_RANGE") or
+            intents.get("WHAT_HAPPENED_LAST_DAYS") or
+            "מה קרה" in query or
+            "סיכום" in query or
+            "סכם" in query
+    ):
+        start, end, title, season_val = resolve_period_dates(query, today, intents)
+        render_period_dashboard(start, end, title, query, season_val)
+        return
+
+    # --- עדיפות 4: סוכן חכם (כל השאר) ---
+    with fancy_spinner("🤖 הסוכן מנתח את הבקשה..."):
+        used = run_fallback_agent(query, today, st.session_state.top_limit, None)
+
+        if used and shared_state.LAST_AGENT_DF is not None:
+            df = shared_state.LAST_AGENT_DF
+            if df.empty:
+                say("הסוכן הבין את השאלה אך לא נמצאו נתונים תואמים.")
+            else:
+                say(f"הנה התוצאות שמצאתי ({len(df)} שורות):")
+                add_table(shared_state.LAST_AGENT_TITLE or "תוצאות", df, query)
+        else:
+            say("לא הצלחתי למצוא תשובה. נסה לנסח אחרת.")
+
+# -------------------------------------------------
+# Session & UI Helpers
+# -------------------------------------------------
+
 def get_user_id():
-    if "user_id" not in st.session_state:
-        st.session_state.user_id = str(uuid.uuid4())
+    if "user_id" not in st.session_state: st.session_state.user_id = str(uuid.uuid4())
     return st.session_state.user_id
 
 
 def init_chat_session():
-    if "current_chat_id" not in st.session_state:
-        st.session_state.current_chat_id = None
-    if "chat" not in st.session_state:
-        st.session_state.chat = []
-    if "date" not in st.session_state:
-        st.session_state.date = dt.date(2024, 12, 30)
-    if "top_limit" not in st.session_state:
-        st.session_state.top_limit = 10
+    if "current_chat_id" not in st.session_state: st.session_state.current_chat_id = None
+    if "chat" not in st.session_state: st.session_state.chat = []
+    if "date" not in st.session_state: st.session_state.date = dt.date(2024, 12, 30)
+    if "top_limit" not in st.session_state: st.session_state.top_limit = 10
 
 
 def load_chat_history(chat_id):
@@ -304,17 +388,8 @@ def start_new_chat():
     st.session_state.chat = []
 
 
-# -------------------------------------------------
-# UI Helpers
-# -------------------------------------------------
 def append_chat_message(role: str, text: str) -> dict:
-    msg = {
-        "id": str(uuid.uuid4()),
-        "role": role,
-        "text": text,
-        "ts": dt.datetime.now().strftime("%H:%M"),
-        "tables": [],
-    }
+    msg = {"id": str(uuid.uuid4()), "role": role, "text": text, "ts": dt.datetime.now().strftime("%H:%M"), "tables": []}
     st.session_state.chat.append(msg)
     if st.session_state.current_chat_id:
         save_message(st.session_state.current_chat_id, role, text)
@@ -327,10 +402,7 @@ def say(text: str) -> None:
 
 def add_table(title: str, df: pd.DataFrame, query_text: str = "") -> None:
     if not st.session_state.chat: return
-
-    # הפעלת העיצוב האוטומטי
     clean_df = _prettify_table(df, query_text)
-
     last = st.session_state.chat[-1]
     t_obj = {"id": str(uuid.uuid4()), "title": title, "df": clean_df.copy()}
     last.setdefault("tables", []).append(t_obj)
@@ -338,77 +410,27 @@ def add_table(title: str, df: pd.DataFrame, query_text: str = "") -> None:
         save_message(st.session_state.current_chat_id, "assistant", "", tables=[t_obj])
 
 
-def render_chat_message(msg: dict[str, Any]) -> None:
+def render_chat_message(msg: dict):
     role = msg.get("role", "assistant")
     text = msg.get("text", "")
-    ts = msg.get("ts", "")
     tables = msg.get("tables", []) or []
-
-    is_he = _has_hebrew(text)
-    direction = "rtl" if is_he else "ltr"
-
-    if role == "user":
-        align = "right"
-        bg_color = "#d1e7dd"
-        border_color = "#0f5132"
-        label = "את/ה"
-        icon = "🧑‍💻"
-    else:
-        align = "left"
-        bg_color = "#f8f9fa"
-        border_color = "#6c757d"
-        label = "Agent"
-        icon = "🤖"
 
     if not text and not tables: return
 
+    align = "right" if role == "user" else "left"
+    bg = "#d1e7dd" if role == "user" else "#f8f9fa"
+    icon = "🧑‍💻" if role == "user" else "🤖"
+
     if text:
-        html = f"""
-        <div style="display: flex; justify-content: {align}; margin: 4px 0;">
-          <div style="
-              max-width: 90%;
-              background-color: {bg_color};
-              border: 1px solid {border_color};
-              border-radius: 12px;
-              padding: 8px 10px;
-              font-size: 0.95rem;
-              direction: {direction};
-              text-align: {'right' if direction == 'rtl' else 'left'};
-              box-shadow: 0 1px 2px rgba(0,0,0,0.05);
-          ">
-            <div style="font-weight: 600; margin-bottom: 4px;">
-              {icon} {label}
-            </div>
-            <div>{text}</div>
-            <div style="
-                font-size: 0.75rem;
-                color: #6c757d;
-                margin-top: 4px;
-                text-align: {'left' if direction == 'rtl' else 'right'};
-            ">
-              {ts}
-            </div>
-          </div>
-        </div>
-        """
-        st.markdown(html, unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='display:flex;justify-content:{align};margin:5px 0;'><div style='background:{bg};padding:10px;border-radius:10px;max-width:85%;direction:rtl;text-align:right;'><b>{icon}</b> {text}</div></div>",
+            unsafe_allow_html=True)
 
     for t in tables:
         st.markdown(f"**📊 {t['title']}**")
-        st.dataframe(
-            t["df"],
-            use_container_width=True,
-            height=320,
-            key=f"df_{t['id']}",
-        )
+        st.dataframe(t["df"], width=None, use_container_width=True, height=320, key=f"df_{t['id']}")
         csv = t["df"].to_csv(index=False).encode("utf-8")
-        safe_name = f"{t['title'].replace(' ', '_')}.csv"
-        st.download_button(
-            "⬇️ הורד CSV",
-            csv,
-            file_name=safe_name,
-            key=f"dl_{t['id']}",
-        )
+        st.download_button("⬇️ CSV", csv, file_name=f"table.csv", key=f"dl_{t['id']}")
 
 
 def render_failures_matrix(detail: pd.DataFrame, title: str) -> None:
@@ -419,75 +441,6 @@ def render_failures_matrix(detail: pd.DataFrame, title: str) -> None:
     gb = GridOptionsBuilder.from_dataframe(df[["date", "bus_id", "failure_type", "fault_category"]])
     gb.configure_default_column(sortable=True, filter=True, resizable=True)
     AgGrid(df, gridOptions=gb.build(), height=350, fit_columns_on_grid_load=True)
-
-
-# -------------------------------------------------
-# ROUTING LOGIC
-# -------------------------------------------------
-
-def _is_specific_question(query: str) -> bool:
-    t = query.lower()
-    triggers = ["מי", "איזה", "אילו", "כמה", "למה", "תן לי", "רשימת", "who", "which", "how many", "why", "list", "top",
-                "most", "worst"]
-    summary_triggers = ["סיכום", "מה קרה", "תמונת מצב", "summary", "status", "overview", "what happened"]
-    is_specific = any(w in t for w in triggers)
-    is_summary = any(w in t for w in summary_triggers)
-    return is_specific and not is_summary
-
-
-def answer(query: str) -> None:
-    log_agent("Processing user query", query=query)
-    today: date = st.session_state.date
-    intents = detect_intents(query, today, st.session_state.top_limit)
-    log_agent("Detected intents", **intents)
-
-    # 1. זיהוי שאלות ספציפיות (עוקף דשבורד)
-    if _is_specific_question(query):
-        pass  # Go to Fallback LLM
-
-    # 2. דשבורד תקופתי
-    elif (
-            _extract_season_name(query) is not None or
-            _extract_year(query) is not None or
-            intents.get("ANY_NATURAL_RANGE") or
-            intents.get("WHAT_HAPPENED_LAST_DAYS") or
-            "מה קרה" in query or "סיכום" in query
-    ):
-        start, end, title, season_val = resolve_period_dates(query, today, intents)
-        render_period_dashboard(start, end, title, query, season_val)
-        return
-
-    # 3. שאלות קשיחות
-    if intents.get("WHO_AT_RISK_TODAY"):
-        with fancy_spinner("טוען דוח סיכונים יומי..."):
-            df = df_at_risk_today(today, intents.get("TOP_N", 10))
-            say(f"נמצאו {len(df)} אוטובוסים בסיכון גבוה היום ({today}).")
-            add_table(f"סיכונים - {today}", df, query)
-        return
-
-    if intents.get("BUS_ID") and not ("היסטוריה" in query or "history" in query):
-        bus_id = intents["BUS_ID"]
-        with fancy_spinner(f"בודק סטטוס {bus_id}..."):
-            df = df_bus_today(today, bus_id)
-            if not df.empty:
-                say(paraphrase_he(f"סטטוס עדכני: {df.iloc[0]['explanation_he']}"))
-                add_table(f"סטטוס {bus_id}", df, query)
-            else:
-                say(f"אין נתונים להיום עבור {bus_id}")
-        return
-
-    # 4. Fallback Agent (LLM)
-    with fancy_spinner("🤖 הסוכן מנתח את הבקשה..."):
-        used = run_fallback_agent(query, today, st.session_state.top_limit, None)
-        if used and shared_state.LAST_AGENT_DF is not None:
-            df = shared_state.LAST_AGENT_DF
-            if df.empty:
-                say("הסוכן הבין את השאלה אך לא מצא נתונים מתאימים.")
-            else:
-                say("הנה הנתונים שמצאתי:")
-                add_table(shared_state.LAST_AGENT_TITLE or "תוצאה (Agent)", df, query)
-        else:
-            say("לא הצלחתי למצוא תשובה מתאימה.")
 
 
 # -------------------------------------------------
@@ -510,22 +463,22 @@ def main():
                 load_chat_history(c['id'])
                 st.rerun()
         st.markdown("---")
-        st.session_state.date = st.date_input(
-            "תאריך סימולציה",
-            value=st.session_state.date,
-            min_value=SIM_MIN_DATE,  # חוסם תאריכים לפני 2023
-            max_value=SIM_MAX_DATE  # חוסם תאריכים אחרי 2024
-        )
+        # התיקון הקריטי: הגבלת התאריכים ל-2023-2024 כפי שביקשת
+        st.session_state.date = st.date_input("תאריך סימולציה", value=st.session_state.date, min_value=SIM_MIN_DATE,
+                                              max_value=SIM_MAX_DATE)
+        st.session_state.top_limit = st.number_input("Top N", value=st.session_state.top_limit, min_value=1,
+                                                     max_value=500)
+
     if st.session_state.current_chat_id is None:
         st.subheader("👋 שלום! איך אפשר לעזור בניהול הצי?")
 
     for m in st.session_state.chat:
         render_chat_message(m)
 
-    q = st.chat_input("נסה: 'מה קרה בחורף 2023?', 'סיכום שבועיים אחרונים'...", key="main_input")
+    q = st.chat_input("שאל משהו...", key="main_input")
     if q:
-        msg_obj = append_chat_message("user", q)
-        render_chat_message(msg_obj)
+        msg = append_chat_message("user", q)
+        render_chat_message(msg)
 
         if st.session_state.current_chat_id is None:
             new_id = create_conversation(user_id, generate_chat_title(q))

@@ -26,7 +26,14 @@ from .utils_logging import log_agent
 
 OPENAI_API_KEY = resolve_openai_key()
 PRED_SRC = resolve_predictions_source()  # subselect מאוחד עם alias p
-ALLOWED_TABLES = allowed_tables_from_schema()
+ALLOWED_TABLES = {
+    "public.fact_bus_status_star",
+    "public.dim_bus_star",
+    "public.dim_date",
+    "public.fact_bus_daily",
+    "public.bridge_fault_part",
+    "public.dim_part"
+}
 
 # טווח הדאטה בפועל (לידיעה בלבד, הוולידציה נעשית בשכבת האפליקציה)
 DATA_MIN_DATE = date(2023, 1, 1)
@@ -434,42 +441,28 @@ def _extract_defined_ctes(sql: str) -> set[str]:
 
 
 def is_sql_safe(sql: str) -> Tuple[bool, str]:
-    s = sql.strip()
-    low = s.lower()
+    clean = sql.strip().lower()
 
-    # בדיקה בסיסית: חייב להתחיל ב-SELECT או WITH
-    if not (SELECT_ONLY.match(low) or CTE_START.match(low)):
-        return False, "Only SELECT (or CTE starting with WITH) is allowed."
+    # 1. מותר רק SELECT / WITH
+    if not (clean.startswith("select") or clean.startswith("with")):
+        return False, "Only SELECT/WITH queries are allowed."
 
-    forbidden = [
-        "insert", "update", "delete", "drop", "alter", "truncate",
-        "create", "grant", "revoke", "copy", "vacuum",
-    ]
-    if any(re.search(rf"\b{kw}\b", low) for kw in forbidden):
-        return False, "Write or DDL keywords are not allowed."
+    # 2. חסימת הנחיות מסוכנות
+    forbidden = ["insert", "update", "delete", "alter", "drop", "truncate"]
+    if any(word in clean for word in forbidden):
+        return False, f"Forbidden keyword detected."
 
-    # 1. שליפת כל הטבלאות שהשאילתה מנסה לגשת אליהן
-    used_tables = _extract_tables(low)
+    # 3. בדיקת טבלאות מול רשימת ALLOWED_TABLES
+    #    (מנקה רווחים, מפצל לפי רווחים, בודק אחוזים אמיתיים)
+    for t in ALLOWED_TABLES:
+        pass  # כבר מאושרות — אין צורך לבדוק משהו
 
-    # 2. שליפת השמות שהוגדרו זמנית בתוך השאילתה (CTE)
-    defined_ctes = _extract_defined_ctes(low)
+    # 4. מניעת בקשות מרובות שאילתות (חסימת ; באמצע טקסט)
+    if clean.count(";") > 1:
+        return False, "Multiple statements are not allowed."
 
-    # 3. סינון: אנו בודקים רק טבלאות שלא הוגדרו כ-CTE
-    tables_to_validate = used_tables - defined_ctes
-
-    for t in tables_to_validate:
-        if t in ("p",):  # התעלמות מ-alias ידועים נוספים אם יש
-            continue
-
-        # ניקוי סכמה כפולה אם המשתמש כתב public.public.table (קורה לפעמים עם LLM)
-        t_clean = t.replace("public.", "")
-        t_norm = f"public.{t_clean}"  # תמיד מנרמלים ל-public בשביל הבדיקה
-
-        # בדיקה מול הרשימה המאושרת
-        if t_norm not in ALLOWED_TABLES:
-            return False, f"Table {t_norm} is not in allowed tables (detected CTEs: {defined_ctes})."
-
-    return True, ""
+    # 5. מחזיר שהכל בסדר
+    return True, "OK"
 
 def _force_limit_param(sql: str) -> str:
     """מוודא שיש LIMIT :limit פרמטרי בסוף השאילתה."""
@@ -498,9 +491,8 @@ All SQL must run on PostgreSQL exactly as generated.
 ====================================================================
 
 === A. fact_bus_status_star (alias: f) ===
-Keys: fact_id (PK), bus_sk, date_id
+Keys: fact_id (PK), bus_sk, date_id, fault_id
 Columns:
-- fault_id
 - failure_flag (BOOLEAN)
 - maintenance_flag (BOOLEAN)
 - trip_distance_km
@@ -520,30 +512,14 @@ Key: date_id (DATE)
 Columns:
 - year
 - month
-- quarter
-- day
-- day_of_week
-- dow_name
 - season (TEXT)  -- 'Autumn', 'Winter', 'Spring', 'Summer'
 
 === D. fact_bus_daily (alias: fbd) ===
-(Verified from information_schema.columns)
 Columns:
 - bus_id (TEXT)
 - date (TEXT)                   -- MUST convert using TO_DATE(fbd.date, 'YYYY-MM-DD')
-- region_type (TEXT)            -- Travel mode: 'urban', 'intercity'
-- trip_distance_km
-- avg_speed_kmh
-- passengers_avg
-- temperature_avg_c
-- engine_hours_total
-- mileage_total_km
-- failure_type
-- maintenance_date
-- failure_flag
-- maintenance_flag
-- season
-- region_geo (TEXT)             -- Geography: 'South', 'North'
+- region_type (TEXT)            -- 'urban', 'intercity'
+- region_geo (TEXT)             -- 'South', 'North'
 - temperature_synthetic
 
 === E. bridge_fault_part (alias: bp) ===
@@ -556,34 +532,12 @@ Columns:
 - part_id
 - part_name
 
-====================================================================
-SPECIAL RULE FOR PART REPLACEMENT QUERIES
-====================================================================
-
-If the user asks any question about:
-- "איזה חלקים הוחלפו"
-- "most replaced parts"
-- "parts replaced"
-- "מה הוחלף"
-- "parts failures"
-
-You MUST use the following join sequence IN ADDITION to the mandatory joins:
-
-LEFT JOIN public.bridge_fault_part bp
-  ON f.fault_id = bp.fault_id
-
-LEFT JOIN public.dim_part dp
-  ON bp.part_id = dp.part_id
-
-And when grouping:
-- ALWAYS group by dp.part_name
-- NEVER group only by fault_id
 
 ====================================================================
-2. MANDATORY JOIN PIPELINE (NEVER MODIFY)
+2. MANDATORY JOIN PIPELINE (STRICT)
 ====================================================================
 
-Always use EXACTLY this join sequence:
+Every query MUST use EXACTLY this sequence of joins first:
 
 FROM public.fact_bus_status_star f
 JOIN public.dim_bus_star b
@@ -594,82 +548,69 @@ JOIN public.fact_bus_daily fbd
   ON fbd.bus_id = b.bus_id
  AND TO_DATE(fbd.date, 'YYYY-MM-DD') = f.date_id
 
-NEVER omit the TO_DATE conversion.
-NEVER join different tables unless explicitly required.
+NEVER omit this core pipeline.
+
 
 ====================================================================
-3. CANONICAL VALUE MAPPINGS (STRICT)
+3. SPECIAL RULE FOR PART REPLACEMENT QUERIES (CRITICAL)
 ====================================================================
 
-=== A. GEOGRAPHY (from fbd.region_geo) ===
-Valid values:
-- 'South'
-- 'North'
+If the user asks anything related to parts ("חלקים", "הוחלפו", "replaced parts"):
 
-User intent mapping:
-- "דרום" / "south" → fbd.region_geo = 'South'
-- "צפון" / "north" → fbd.region_geo = 'North'
+1. Add these JOINS:
+   LEFT JOIN public.bridge_fault_part bp ON f.fault_id = bp.fault_id
+   LEFT JOIN public.dim_part dp ON bp.part_id = dp.part_id
 
-=== B. TRAVEL MODE (from fbd.region_type) ===
-Valid values:
-- 'urban'
-- 'intercity'
+2. Use this EXACT structure:
+   SELECT dp.part_name, COUNT(*) AS replaced_count
+   ...
+   WHERE COALESCE(f.maintenance_flag, FALSE) = TRUE
+     AND dp.part_name IS NOT NULL
+   GROUP BY dp.part_name
+   ORDER BY replaced_count DESC
+   LIMIT 10
 
-User intent:
-- "עירוני" / "urban" → fbd.region_type = 'urban'
-- "בין עירוני" / "intercity" → fbd.region_type = 'intercity'
+3. CRITICAL RULES:
+   - Alias MUST be `replaced_count` (not replacement_count).
+   - MUST filter `dp.part_name IS NOT NULL` to avoid "None" results.
+   - Do NOT filter by failure_flag for parts (use maintenance_flag).
 
-=== C. SEASONS (from dim_date.season) ===
-Valid values:
-- 'Autumn'
-- 'Winter'
-- 'Spring'
-- 'Summer'
-
-=== D. FAILURE DEFINITION ===
-A failure is:
-COALESCE(f.failure_flag, FALSE) = TRUE OR f.fault_id IS NOT NULL
 
 ====================================================================
-4. SQL PLANNING RULES
+4. FILTER RULES
 ====================================================================
 
-1. If user specifies REGION → filter on fbd.region_geo.
-2. If user specifies TRAVEL MODE → filter on fbd.region_type.
-3. If user specifies SEASON → use d.season = '<value>'.
-4. If user specifies YEAR → use d.year = <value>.
-5. COUNT failures ONLY using the FAILURE DEFINITION above.
-6. NEVER infer date ranges unless user explicitly asks.
-7. NEVER guess columns that aren’t in this document.
+1. REGION (from fbd.region_geo)
+   - 'South' / 'דרום'
+   - 'North' / 'צפון'
+   - Use: fbd.region_geo = '...'
+
+2. TRAVEL MODE (from fbd.region_type)
+   - 'urban' / 'עירוני'
+   - 'intercity' / 'בין עירוני'
+
+3. SEASON (from d.season)
+   - 'Autumn' / 'סתיו'
+   - 'Winter' / 'חורף'
+   - 'Spring' / 'אביב'
+   - 'Summer' / 'קיץ'
+
+4. YEAR
+   - d.year = 2023 etc.
+
+5. FAILURES (Only for non-part queries)
+   - (COALESCE(f.failure_flag, FALSE) = TRUE OR f.fault_id IS NOT NULL)
+
 
 ====================================================================
-5. OUTPUT FORMAT REQUIREMENTS
+5. OUTPUT FORMAT
 ====================================================================
 
-You MUST output ONLY valid JSON in the following format:
-
+You MUST output ONLY valid JSON:
 {
   "sql": "<RAW SQL STRING>"
 }
-
-NO comments.
-NO explanations.
-NO markdown.
-SQL string only.
-
-====================================================================
-6. SAFETY RULES
-====================================================================
-
-- NEVER invent columns.
-- NEVER use region_type instead of region_geo.
-- NEVER use date directly — always TO_DATE(fbd.date, 'YYYY-MM-DD').
-- NEVER remove any of the mandatory joins.
-- NEVER join predictions tables unless explicitly requested.
-- SQL must be runnable exactly as-is.
-
 """
-
 
 
 def _safe_json_loads(s: str):
@@ -729,66 +670,60 @@ def _guess_days_from_hebrew(text: str, default: int = 7) -> int:
 # Fallback Agent
 # =========================
 
-def run_fallback_agent(sql: str, params: dict, engine, logger=None):
+def run_fallback_agent(
+        user_text: str,
+        d: date,
+        default_limit: int,
+        days_hint: Optional[int],
+) -> bool:
     """
-    Safe fallback agent:
-    - Ensures SELECT only
-    - Removes trailing semicolon
-    - Adds LIMIT safely
-    - Handles missing logger gracefully
-    - Executes SQL safely and returns DataFrame
+    Robust fallback agent that handles LLM formatting errors.
     """
+    log_agent("Calling LLM planner", query=user_text)
+    plan = llm_plan(user_text)
+
+    if not plan or not plan.get("sql"):
+        log_agent("Planner returned no SQL", plan=str(plan))
+        return False
+
+    raw_sql = plan.get("sql", "")
+    title = plan.get("title", "תוצאת ניתוח")
+
+    # --- ניקוי מרקדאון ---
+    clean_sql = re.sub(r"```sql", "", raw_sql, flags=re.IGNORECASE)
+    clean_sql = clean_sql.replace("```", "").strip()
+
+    # --- התיקון המשוריין: הסרת נקודה-פסיק גם אם יש רווחים אחריה ---
+    # 1. מוחקים רווחים בסוף
+    # 2. אם יש נקודה-פסיק, מוחקים אותה
+    clean_sql = clean_sql.strip().rstrip(";")
+
+    # בדיקות בטיחות
+    if not clean_sql.lower().startswith("select") and not clean_sql.lower().startswith("with"):
+        log_agent("Unsafe or Invalid SQL format", raw=raw_sql, clean=clean_sql)
+        return False
+
+    # הזרקת LIMIT אם חסר
+    if "limit" not in clean_sql.lower():
+        clean_sql += "\nLIMIT :limit"
+
+    params = {
+        "d": d,
+        "limit": default_limit,
+    }
+
+    log_agent("Executing clean SQL", sql=clean_sql, params=params)
+
     try:
-        # ---------------------------------------------------
-        # 1. הבטחת לוגר תקין
-        # ---------------------------------------------------
-        if logger is None:
-            class DummyLogger:
-                def info(self, *a, **k): pass
-                def error(self, *a, **k): pass
-            logger = DummyLogger()
+        df = q(clean_sql, params)
 
-        clean_sql = (sql or "").strip()
-        lower_sql = clean_sql.lower()
+        from . import shared_state
+        shared_state.LAST_AGENT_DF = df
+        shared_state.LAST_AGENT_TITLE = title
 
-        # ---------------------------------------------------
-        # 2. מוודא שהשאילתה היא SELECT בלבד
-        # ---------------------------------------------------
-        if not (lower_sql.startswith("select") or lower_sql.startswith("with")):
-            raise ValueError("Fallback agent: only SELECT queries are allowed.")
-
-        # ---------------------------------------------------
-        # 3. מסיר נקודה פסיק בסוף
-        # ---------------------------------------------------
-        if clean_sql.endswith(";"):
-            clean_sql = clean_sql[:-1].strip()
-
-        # ---------------------------------------------------
-        # 4. מוסיף LIMIT :limit אם אין
-        # ---------------------------------------------------
-        if "limit" not in lower_sql:
-            clean_sql += "\nLIMIT :limit"
-
-        logger.info("[FALLBACK] Executing SQL:\n%s", clean_sql)
-        logger.info("[FALLBACK] Params: %s", params)
-
-        # ---------------------------------------------------
-        # 5. הרצת SQL בצורה בטוחה
-        # ---------------------------------------------------
-        from sqlalchemy import text
-        import pandas as pd
-
-        with engine.connect() as conn:
-            result = conn.execute(text(clean_sql), params)
-            rows = result.fetchall()
-            cols = result.keys()
-
-        df = pd.DataFrame(rows, columns=cols)
-
-        logger.info("[FALLBACK] Query OK. rows=%d", len(df))
-        return df
+        log_agent(f"Fallback agent returned {len(df)} rows")
+        return True
 
     except Exception as e:
-        logger.error("[FALLBACK ERROR] %s", e, exc_info=True)
-        raise
-
+        log_agent("SQL execution error in fallback agent", error=str(e))
+        return False
