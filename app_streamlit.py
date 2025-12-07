@@ -77,41 +77,83 @@ class fancy_spinner:
 
 def _extract_time_period(text: str) -> int:
     """
-    מחלץ טווח זמן גמיש (מספר כלשהו + יחידת זמן) מתוך הטקסט.
-    תומך ב: ימים, שבועות, חודשים, שנים.
+    מחלץ טווח זמן גמיש מתוך טקסט בעברית/אנגלית.
+    כולל תמיכה בצורות זוגיות: יומיים, שבועיים, חודשיים, שנתיים.
+    מחזיר כמות ימים.
     """
-    t = text.lower()
+    t = (text or "").lower().strip()
 
-    # 1. זיהוי מספרים כללי (חילוץ כל המספרים במשפט)
-    # מחפש רצף של ספרות שנמצא ליד מילת מפתח
+    # --- ניקוי עברית מלוכלכת (אותיות סופיות) ---
+    t = t.translate(str.maketrans({
+        'ם': 'מ',
+        'ן': 'נ',
+        'ך': 'כ',
+        'ף': 'פ',
+        'ץ': 'צ',
+    }))
 
-    # שנה/ים
+    # ======================================================
+    # 1. צורות זוגיות (Duels) — עדיפות עליונה
+    # ======================================================
+    if "יומיים" in t or "יוםיים" in t:
+        return 2
+
+    if "שבועיים" in t or "שבועין" in t or "שבוים" in t:
+        return 14
+
+    if "חודשיים" in t or "חדשיים" in t:
+        return 60
+
+    if "שנתיים" in t:
+        return 730  # 365 * 2
+
+    # ======================================================
+    # 2. מספר + יחידת זמן
+    # ======================================================
+
+    # שנים
     m_year = re.search(r"(\d+)\s*(?:שנה|שנים|year|years)", t)
     if m_year:
         return int(m_year.group(1)) * 365
 
-    # חודש/ים
+    # חודשים
     m_month = re.search(r"(\d+)\s*(?:חודש|חודשים|month|months)", t)
     if m_month:
         return int(m_month.group(1)) * 30
 
-    # שבוע/ות
+    # שבועות
     m_week = re.search(r"(\d+)\s*(?:שבוע|שבועות|week|weeks)", t)
     if m_week:
         return int(m_week.group(1)) * 7
 
-    # יום/ימים (הכי נפוץ - תופס "251 יום", "5 ימים")
+    # ימים
     m_day = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
     if m_day:
         return int(m_day.group(1))
 
-    # זיהוי ללא מספר (מקרים בודדים)
-    if "שנה" in t or "year" in t: return 365
-    if "חודש" in t or "month" in t: return 30
-    if "שבוע" in t or "week" in t: return 7
-    if "יום" in t or "day" in t: return 1
+    # ======================================================
+    # 3. יחידת זמן ללא מספר (מילה כללית)
+    # ======================================================
+    # שנה
+    if "שנה" in t or "year" in t:
+        return 365
 
-    return 14  # ברירת מחדל אם לא זוהה כלום
+    # חודש
+    if "חודש" in t or "month" in t:
+        return 30
+
+    # שבוע
+    if "שבוע" in t or "week" in t:
+        return 7
+
+    # יום
+    if "יום" in t or "day" in t:
+        return 1
+
+    # ======================================================
+    # 4. ברירת מחדל
+    # ======================================================
+    return 14
 
 def _extract_days_from_query(text: str, default: int = 30) -> int:
     return _extract_time_period(text)
@@ -222,7 +264,7 @@ def resolve_period_dates(query: str, today: date, intents: dict) -> Tuple[date, 
         return rng[0], rng[1], rng[2], None
 
     # חישוב מתמטי לפי טווח הזמן המבוקש
-    days = _extract_time_period(query)
+    days = intents.get("DAYS") or _extract_time_period(query)
 
     end = today
     start = today - timedelta(days=days)

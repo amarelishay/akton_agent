@@ -170,7 +170,7 @@ def map_likely_faults_from_query(user_text: str) -> list[str]:
                 if len(tok) < 3:
                     continue
                 ratio = SequenceMatcher(None, tok, s_low).ratio()
-                if ratio >= 0.8:
+                if ratio >= 0.7:
                     mapped.append(canon)
                     found = True
                     break

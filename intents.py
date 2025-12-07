@@ -3,41 +3,88 @@ from difflib import SequenceMatcher
 from typing import Any, Dict
 import re
 
-# --- שאלות זהב (Hardcoded Triggers) ---
-# רק שאלות שדומות לאלו ב-90% יפעילו את הדשבורדים הקבועים.
+# -------------------------
+# Normalization Helpers
+# -------------------------
+
+# ממיר אותיות סופיות → רגילות כדי לא לפספס התאמות
+HEB_FINALS = str.maketrans({
+    'ם': 'מ',
+    'ן': 'נ',
+    'ף': 'פ',
+    'ך': 'כ',
+    'ץ': 'צ',
+})
+
+def normalize_text(t: str) -> str:
+    if not t:
+        return ""
+    t = t.lower().strip()
+    t = t.translate(HEB_FINALS)
+    t = re.sub(r"\s+", " ", t)  # רווח אחד בלבד
+    t = re.sub(r"[^\w\sא-ת]", "", t)  # מסיר סימנים מיותרים
+    return t
+
+
+# ----------------------------
+# GOLDEN QUESTIONS (Expanded)
+# ----------------------------
+
 GOLDEN_EXAMPLES = {
     "WHO_AT_RISK_TODAY": [
         "מי בסיכון היום",
         "מי בסיכון",
         "אילו אוטובוסים בסיכון",
         "רשימת סיכונים להיום",
-        "Who is at risk today",
-        "High risk buses",
-        "Which buses are at risk"
+        "מי בסכון",          # שגיאות נפוצות
+        "מי בסקון",
+        "מי בסכיון",
+        "מי בסיכן",
+        "who is at risk today",
+        "high risk buses",
+        "which buses are at risk",
     ],
 
     "BUS_STATUS": [
-        # יטופל בנפרד ע"י Regex כי זה כולל מספר משתנה
+        # מטופל ע"י Regex, לא צריך דוגמאות
     ],
 
-    # אך ורק סיכומים כלליים בזמן מוגדר מראש
     "PERIOD_SUMMARY": [
         "מה קרה בשבוע האחרון",
         "מה קרה בשבועיים האחרונים",
         "סיכום שבועיים אחרונים",
-        "סכם לי את השבוע",  # <--- הוספנו את זה
-        "סכם לי את התקופה",  # <--- ואת זה
-        "summary of last week"
-    ]
+        "סכם לי את השבוע",
+        "סכם לי את התקופה",
+        "סיכום שבוע",
+        "summary of last week",
+        "what happened this week",
+        "status last week",
+        "מה קרה השבוע",
+        "מה היה השבוע",
+        "תמונת מצב שבועית",
+        "סכון שבוע",   # שגיאות נפוצות
+    ],
 }
 
 
-def _get_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+# ----------------------------
+# Similarity Function
+# ----------------------------
 
+def _get_similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+# ----------------------------
+# Main Intent Detector
+# ----------------------------
 
 def detect_intents(text: str, today: Any, default_top_limit: int) -> Dict[str, Any]:
-    t = text.strip()
+
+    # Normalize aggressively
+    t_raw = text or ""
+    t = normalize_text(t_raw)
+
     out: Dict[str, Any] = {
         "WHO_AT_RISK_TODAY": False,
         "PERIOD_SUMMARY": False,
@@ -46,23 +93,26 @@ def detect_intents(text: str, today: Any, default_top_limit: int) -> Dict[str, A
         "DAYS": 14
     }
 
-    # 1. זיהוי אוטובוס ספציפי (Regex קשיח - תמיד תופס)
-    # תופס: BUS 17, אוטובוס 100, bus_050
-    m_bus = re.search(r"(?:BUS|אוטובוס)[_\-\s]*(\d{1,3})", t, re.IGNORECASE)
+    # -----------------------------------------------------
+    # 1. זיהוי BUS ID עם Regex (מדויק ותמיד תקף)
+    # -----------------------------------------------------
+    m_bus = re.search(r"(?:bus|אוטובוס)[_\-\s]*0*(\d{1,3})", t_raw, re.IGNORECASE)
     if m_bus:
         out["BUS_ID"] = f"BUS_{int(m_bus.group(1)):03d}"
         return out
 
-        # 2. זיהוי שאלות זהב (Strict Matching)
-    # סף 0.9 אומר "כמעט זהה".
-    threshold = 0.9
+    # -----------------------------------------------------
+    # 2. Golden Questions Detection (Fuzzy)
+    # -----------------------------------------------------
 
+    threshold = 0.75            # הורדנו מ-0.9 כדי לתפוס שגיאות כתיב
     best_score = 0.0
     best_intent = None
 
     for intent, examples in GOLDEN_EXAMPLES.items():
         for ex in examples:
-            score = _get_similarity(t, ex)
+            ex_norm = normalize_text(ex)
+            score = _get_similarity(t, ex_norm)
             if score > best_score:
                 best_score = score
                 best_intent = intent
@@ -70,10 +120,15 @@ def detect_intents(text: str, today: Any, default_top_limit: int) -> Dict[str, A
     if best_score >= threshold:
         out[best_intent] = True
 
-        # אם זוהה סיכום, ננסה לחלץ ימים (אם המשתמש שינה את המספר)
+        # חילוץ ימים מתוך השאלה: "17 ימים", "3 day", "5 days"
         if best_intent == "PERIOD_SUMMARY":
             m_days = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
             if m_days:
                 out["DAYS"] = int(m_days.group(1))
 
+        return out
+
+    # -----------------------------------------------------
+    # סיום: אם לא זוהה שום Golden Intent → חוזרים לסוכן
+    # -----------------------------------------------------
     return out
