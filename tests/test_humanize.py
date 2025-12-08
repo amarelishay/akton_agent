@@ -2,8 +2,14 @@ import os
 
 # Set a dummy OpenAI API key so that imports do not fail
 os.environ.setdefault("OPENAI_API_KEY", "dummy-key")
+import sys
+# Add repository root to PYTHONPATH so tests can import modules
 
-import akton_agent.humanize as humanize
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+
+impor thumanize as humanize
 
 
 def test_humanize_reason_he_none():
