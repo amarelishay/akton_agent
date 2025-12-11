@@ -1,134 +1,223 @@
 from __future__ import annotations
+import re
 from difflib import SequenceMatcher
 from typing import Any, Dict
-import re
 
-# -------------------------
+# ======================================================
 # Normalization Helpers
-# -------------------------
+# ======================================================
 
-# ממיר אותיות סופיות → רגילות כדי לא לפספס התאמות
 HEB_FINALS = str.maketrans({
-    'ם': 'מ',
-    'ן': 'נ',
-    'ף': 'פ',
-    'ך': 'כ',
-    'ץ': 'צ',
+    'ם': 'מ', 'ן': 'נ', 'ף': 'פ', 'ך': 'כ', 'ץ': 'צ',
 })
 
 def normalize_text(t: str) -> str:
+    """ Normalize Hebrew/English text, collapse finals, remove punctuation. """
     if not t:
         return ""
     t = t.lower().strip()
     t = t.translate(HEB_FINALS)
-    t = re.sub(r"\s+", " ", t)  # רווח אחד בלבד
-    t = re.sub(r"[^\w\sא-ת]", "", t)  # מסיר סימנים מיותרים
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\sא-ת]", " ", t)
     return t
 
 
-# ----------------------------
-# GOLDEN QUESTIONS (Expanded)
-# ----------------------------
+# ======================================================
+# Utility: String similarity
+# ======================================================
+
+def _sim(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+# ======================================================
+# Golden Examples (for high-level intents)
+# ======================================================
 
 GOLDEN_EXAMPLES = {
     "WHO_AT_RISK_TODAY": [
         "מי בסיכון היום",
         "מי בסיכון",
+        "מי בסיכון כעת",
         "אילו אוטובוסים בסיכון",
         "רשימת סיכונים להיום",
-        "מי בסכון",          # שגיאות נפוצות
-        "מי בסקון",
-        "מי בסכיון",
-        "מי בסיכן",
         "who is at risk today",
         "high risk buses",
         "which buses are at risk",
     ],
 
-    "BUS_STATUS": [
-        # מטופל ע"י Regex, לא צריך דוגמאות
-    ],
-
     "PERIOD_SUMMARY": [
+        # שבועי
         "מה קרה בשבוע האחרון",
         "מה קרה בשבועיים האחרונים",
-        "סיכום שבועיים אחרונים",
-        "סכם לי את השבוע",
-        "סכם לי את התקופה",
         "סיכום שבוע",
+        "סיכום שבועיים",
+        "תמונת מצב שבוע",
         "summary of last week",
-        "what happened this week",
         "status last week",
+        "what happened this week",
         "מה קרה השבוע",
-        "מה היה השבוע",
-        "תמונת מצב שבועית",
-        "סכון שבוע",   # שגיאות נפוצות
+
+        # חודשי – חדש
+        "סיכום חודשי",
+        "סיכום חודש",
+        "מה קרה בחודש האחרון",
+        "summary of last month",
+        "status last month",
+        "monthly summary",
     ],
 }
 
 
-# ----------------------------
-# Similarity Function
-# ----------------------------
+# ======================================================
+# Days extraction
+# ======================================================
 
-def _get_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a, b).ratio()
+def extract_days(text: str) -> int:
+    """ Extract number of days from Hebrew/English natural expressions. """
+    t = normalize_text(text)
+
+    if "שבועיים" in t or "שבועים" in t:
+        return 14
+    if "חודשיים" in t or "חדשיים" in t:
+        return 60
+    if "יומיים" in t:
+        return 2
+
+    m = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r"(\d+)\s*(?:שבוע|שבועות|week|weeks)", t)
+    if m:
+        return int(m.group(1)) * 7
+
+    m = re.search(r"(\d+)\s*(?:חודש|חודשים|month|months)", t)
+    if m:
+        return int(m.group(1)) * 30
+
+    # מילים בלי מספר
+    if "שבוע" in t:
+        return 7
+    if "חודש" in t or "חודשי" in t:
+        return 30
+    if "יום" in t:
+        return 1
+
+    # ברירת מחדל
+    return 14
 
 
-# ----------------------------
-# Main Intent Detector
-# ----------------------------
+# ======================================================
+# BUS ID Detection
+# ======================================================
+
+def detect_bus_id(text_raw: str) -> str | None:
+    """
+    Detects:
+    - "bus 32", "bus32"
+    - "אוטובוס 32"
+    - "רכב 32"
+    - Or just "32" in context
+    """
+    patterns = [
+        r"(?:bus|אוטובוס|רכב)[^\d]*(\d{1,4})",
+        r"\b(\d{1,4})\b"
+    ]
+    for p in patterns:
+        m = re.search(p, text_raw, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+# ======================================================
+# Main Intent Engine
+# ======================================================
 
 def detect_intents(text: str, today: Any, default_top_limit: int) -> Dict[str, Any]:
 
-    # Normalize aggressively
     t_raw = text or ""
     t = normalize_text(t_raw)
 
     out: Dict[str, Any] = {
         "WHO_AT_RISK_TODAY": False,
         "PERIOD_SUMMARY": False,
+        "BUS_LOCATION": False,
         "BUS_ID": None,
         "TOP_N": default_top_limit,
-        "DAYS": 14
+        "DAYS": 14,
     }
 
-    # -----------------------------------------------------
-    # 1. זיהוי BUS ID עם Regex (מדויק ותמיד תקף)
-    # -----------------------------------------------------
-    m_bus = re.search(r"(?:bus|אוטובוס)[_\-\s]*0*(\d{1,3})", t_raw, re.IGNORECASE)
-    if m_bus:
-        out["BUS_ID"] = f"BUS_{int(m_bus.group(1)):03d}"
+    # -----------------------------
+    # Detect BUS ID
+    # -----------------------------
+    bus_id = detect_bus_id(t_raw)
+    if bus_id:
+        out["BUS_ID"] = bus_id
+
+    # -----------------------------
+    # BUS LOCATION — robust matching
+    # -----------------------------
+    location_keywords = [
+        "איפה", "באיזה אזור", "באיזה מרחב",
+        "צפון", "דרום",
+        "north", "south", "region", "location",
+    ]
+
+    location_error_patterns = [
+        r"דרו?מ", r"דרום", r"בדרו?מ", r"הדרום", r"הבדרום",
+        r"צפו?נ", r"צפון", r"בצפו?נ", r"הצפון",
+    ]
+
+    found_location = False
+
+    if any(k in t for k in location_keywords):
+        found_location = True
+
+    for pat in location_error_patterns:
+        if re.search(pat, t):
+            found_location = True
+            break
+
+    if found_location and bus_id:
+        out["BUS_LOCATION"] = True
         return out
 
-    # -----------------------------------------------------
-    # 2. Golden Questions Detection (Fuzzy)
-    # -----------------------------------------------------
-
-    threshold = 0.75            # הורדנו מ-0.9 כדי לתפוס שגיאות כתיב
+    # -----------------------------
+    # Golden Intents (WHO_AT_RISK, PERIOD_SUMMARY)
+    # -----------------------------
     best_score = 0.0
     best_intent = None
+    threshold = 0.75
 
     for intent, examples in GOLDEN_EXAMPLES.items():
         for ex in examples:
-            ex_norm = normalize_text(ex)
-            score = _get_similarity(t, ex_norm)
+            score = _sim(t, normalize_text(ex))
             if score > best_score:
                 best_score = score
                 best_intent = intent
 
     if best_score >= threshold:
         out[best_intent] = True
-
-        # חילוץ ימים מתוך השאלה: "17 ימים", "3 day", "5 days"
         if best_intent == "PERIOD_SUMMARY":
-            m_days = re.search(r"(\d+)\s*(?:יום|ימים|day|days)", t)
-            if m_days:
-                out["DAYS"] = int(m_days.group(1))
-
+            out["DAYS"] = extract_days(t_raw)
         return out
 
-    # -----------------------------------------------------
-    # סיום: אם לא זוהה שום Golden Intent → חוזרים לסוכן
-    # -----------------------------------------------------
+    # -----------------------------
+    # Heuristic fallback for PERIOD_SUMMARY
+    # -----------------------------
+    # דוגמה: "תן לי סיכום חודשי", "תן לי סיכום שבועי", "תן סיכום של 3 חודשים"
+    summary_triggers = ["סיכום", "תמונת מצב", "summary", "status"]
+    period_words = ["יום", "ימים", "שבוע", "שבועות", "חודש", "חודשים",
+                    "day", "days", "week", "weeks", "month", "months"]
+
+    if any(w in t for w in summary_triggers) and any(w in t for w in period_words):
+        out["PERIOD_SUMMARY"] = True
+        out["DAYS"] = extract_days(t_raw)
+        return out
+
+    # -----------------------------
+    # Default fallback: no intent detected
+    # -----------------------------
     return out
