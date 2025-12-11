@@ -1,8 +1,16 @@
 from __future__ import annotations
 import re
 from typing import Optional
+
 import pandas as pd
-from .config import OPENAI_MODEL, LLM_TEMPERATURE, resolve_openai_key
+
+# --- Import config: עובד גם כחלק מחבילה וגם כמודול בודד ---
+try:
+    # כשמייבאים מתוך החבילה (app_streamlit, agent_queries וכו')
+    from .config import OPENAI_MODEL, LLM_TEMPERATURE, resolve_openai_key
+except ImportError:
+    # כשpytest עושה "import humanize" מהשורש
+    from config import OPENAI_MODEL, LLM_TEMPERATURE, resolve_openai_key
 
 OPENAI_API_KEY = resolve_openai_key()
 
@@ -53,7 +61,7 @@ def humanize_reason_he(reason: Optional[str]) -> str:
 
     # ניקוי רעשים טכניים: (0.5σ), ↑, +
     r = re.sub(r"\(\d+(\.\d+)?[σ]?\)", "", r)
-    r = re.sub(r"[\↑\+]", "", r)
+    r = re.sub(r"[↑\+]", "", r)
 
     # סידור פסיקים ורווחים
     r = re.sub(r"\s{2,}", " ", r)
@@ -63,6 +71,9 @@ def humanize_reason_he(reason: Optional[str]) -> str:
 
 
 def where_from_likely_fault(likely_fault: Optional[str]) -> str:
+    """
+    ממפה ערך likely_fault לתיאור מערכת בעברית.
+    """
     val = (likely_fault or "").strip()
     for k, v in LIKELY_FAULT_MAP_HE.items():
         if k.lower() in val.lower():
@@ -83,8 +94,11 @@ def paraphrase_he(text: str) -> str:
             model=OPENAI_MODEL,
             temperature=LLM_TEMPERATURE,
             messages=[
-                {"role": "system", "content": "אתה מנהל צי רכב. שכתב את המשפט לעברית מקצועית וקצרה."},
-                {"role": "user", "content": text}
+                {
+                    "role": "system",
+                    "content": "אתה מנהל צי רכב. שכתב את המשפט לעברית מקצועית וקצרה.",
+                },
+                {"role": "user", "content": text},
             ],
         )
         return (resp.choices[0].message.content or "").strip()
@@ -105,6 +119,9 @@ def pretty_bus_id(bus_id: str | None) -> str:
 
 
 def add_row_explanation(df: pd.DataFrame, prob_col: str) -> pd.DataFrame:
+    """
+    מוסיף עמודת explanation_he לטבלה לפי הסתברות, מערכת וגורמים.
+    """
     if df.empty:
         return df
 
@@ -131,7 +148,6 @@ def add_row_explanation(df: pd.DataFrame, prob_col: str) -> pd.DataFrame:
         reasons = row.get("reason_he", "")
         system = row.get("where_he", "")
 
-        # הפורמט המתוקן
         base_text = (
             f"ל-{bus_name} יש הסתברות של {p_txt} לתקלה ב-{date_str}. "
             f"החשד הוא לתקלה {system}. "
